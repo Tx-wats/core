@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -12,6 +12,8 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -172,7 +174,10 @@ pub async fn run_with_reload(
 ) -> Result<()> {
     // `build_poll_client` applies `http_tcp_keepalive_secs` itself.
     let client = build_poll_client(&cfg)?;
-    let mut cursors = load_cursors(&cfg);
+    // Shared so each contract's task can persist the whole cursor map after a
+    // cycle that advanced its own cursor.
+    let cursors = Arc::new(Mutex::new(load_cursors(&cfg)));
+    let cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
 
     #[cfg(feature = "metrics")]
     {
@@ -268,18 +273,17 @@ pub async fn run_with_reload(
         for contract in &cfg.contracts {
             let interval =
                 Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
-            let cursor = cursors
-                .get(&contract.contract_id)
-                .cloned()
-                .unwrap_or_else(|| "now".to_string());
             tasks.spawn(poll_contract_forever(
                 client.clone(),
                 contract.clone(),
-                cursor,
                 interval,
                 dry_run,
                 Arc::clone(&counters),
                 stop_rx.clone(),
+                CursorPersistence {
+                    cursors: Arc::clone(&cursors),
+                    path: cursor_file.clone(),
+                },
             ));
         }
 
@@ -293,20 +297,27 @@ pub async fn run_with_reload(
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok((contract_id, cursor)) => {
-                    cursors.insert(contract_id, cursor);
+                    lock(&cursors).insert(contract_id, cursor);
                 }
                 Err(e) => error!(error = ?e, "contract polling task panicked"),
             }
         }
+        // Issue #5: flush once more on the way out, so a graceful shutdown
+        // persists cursors advanced since the last per-cycle write.
+        if let Err(e) = save_cursors(&cfg, &lock(&cursors)) {
+            error!(error = %e, "failed to flush cursors on shutdown");
+        }
 
         let Some(new_cfg) = new_cfg else { break };
         let start = load_cursors(&new_cfg);
-        cursors = new_cfg
+        // Existing cursors win over the reloaded config's file; contracts new
+        // to the config start from the saved cursor, else `now`.
+        let merged: HashMap<String, String> = new_cfg
             .contracts
             .iter()
             .map(|c| {
                 let id = c.contract_id.clone();
-                let cursor = cursors
+                let cursor = lock(&cursors)
                     .get(&id)
                     .or_else(|| start.get(&id))
                     .cloned()
@@ -314,6 +325,7 @@ pub async fn run_with_reload(
                 (id, cursor)
             })
             .collect();
+        *lock(&cursors) = merged;
         counters
             .contracts
             .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
@@ -346,13 +358,18 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 async fn poll_contract_forever(
     client: Client,
     contract: WatchedContract,
-    cursor: String,
     interval: Duration,
     dry_run: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
+    persist: CursorPersistence,
 ) -> (String, String) {
-    let mut cursors = HashMap::from([(contract.contract_id.clone(), cursor)]);
+    let contract_id = contract.contract_id.clone();
+    let cursor = lock(&persist.cursors)
+        .get(&contract_id)
+        .cloned()
+        .unwrap_or_else(|| "now".to_string());
+    let mut cursors = HashMap::from([(contract_id.clone(), cursor)]);
     let mut state = ContractPollState::default();
     // A single tracker for this contract's lifetime, so cooldowns survive
     // across poll cycles rather than deduping only within one.
@@ -385,6 +402,22 @@ async fn poll_contract_forever(
                     metrics::inc_alerts(&contract.label, network, alerts);
                     metrics::record_poll_success(&contract.label, network);
                     metrics::mark_poll_success();
+                }
+                // Issue #5: persist the cursor as soon as it advances, so a
+                // restart does not replay transactions we have already seen.
+                if let Some(path) = &persist.path {
+                    if let Some(latest) = cursors.get(&contract_id) {
+                        let mut guard = lock(&persist.cursors);
+                        if guard.get(&contract_id) != Some(latest) {
+                            guard.insert(contract_id.clone(), latest.clone());
+                            if let Err(e) = write_cursor_file(path, &guard) {
+                                error!(
+                                    contract = %contract.label, error = %e,
+                                    "failed to persist cursor file; cursors may be replayed after a restart"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -447,10 +480,47 @@ fn save_cursors(cfg: &AppConfig, cursors: &HashMap<String, String>) -> Result<()
     let Some(path) = &cfg.cursor_file else {
         return Ok(());
     };
+    write_cursor_file(Path::new(path), cursors)
+}
+
+/// Shared cursor state a per-contract task needs to persist the whole cursor
+/// file after advancing its own entry.
+struct CursorPersistence {
+    /// Every contract's latest cursor, shared across tasks.
+    cursors: Arc<Mutex<HashMap<String, String>>>,
+    /// `None` when `cursor_file` is not configured.
+    path: Option<PathBuf>,
+}
+
+/// Lock a mutex, recovering the contents if a previous holder panicked.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Write the cursor map to `path` atomically: a temp file in the same directory
+/// is written and fsynced, then renamed over the target, and the directory is
+/// fsynced so the rename itself survives a crash. An interrupted write
+/// therefore leaves the previous file intact rather than a truncated one.
+fn write_cursor_file(path: &Path, cursors: &HashMap<String, String>) -> Result<()> {
     let raw = serde_json::to_string_pretty(cursors).context("failed to serialize cursors")?;
-    let tmp = format!("{}.tmp", path);
-    fs::write(&tmp, raw).with_context(|| format!("failed to write cursor file '{}'", tmp))?;
-    fs::rename(&tmp, path).with_context(|| format!("failed to write cursor file '{}'", path))?;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp)
+            .with_context(|| format!("failed to create cursor file '{}'", tmp.display()))?;
+        f.write_all(raw.as_bytes())
+            .with_context(|| format!("failed to write cursor file '{}'", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("failed to sync cursor file '{}'", tmp.display()))?;
+    }
+    fs::rename(&tmp, path)
+        .with_context(|| format!("failed to replace cursor file '{}'", path.display()))?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        // Persist the rename itself. Failure here is not fatal: the data is
+        // already durable, only the directory entry may be lost on a crash.
+        if let Ok(handle) = fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
     Ok(())
 }
 
