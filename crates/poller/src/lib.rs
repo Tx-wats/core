@@ -735,10 +735,8 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
             info!(contract = %contract.label, "contract is disabled — skipping");
             continue;
         }
-        match poll_contract(&client, contract, &mut cursors, dry_run).await {
         let mut state = ContractPollState::default();
-        match poll_contract(&client, contract, &mut cursors, &mut state, dry_run).await {
-        match poll_contract(&client, contract, &mut cursors, &mut cooldowns, dry_run).await {
+        match poll_contract(&client, contract, &mut cursors, &mut state, &mut cooldowns, dry_run).await {
             Ok((txs, alerts, webhook_failures)) => {
                 report.transactions += txs;
                 report.alerts += alerts;
@@ -755,6 +753,70 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
     Ok(report)
 }
 
+// ── 429 Retry-After & Backoff Utilities (#9, #10) ───────────────────────────
+
+/// Parse a `Retry-After` header value according to RFC 9110 § 10.2.3.
+///
+/// Supports:
+/// - delay-seconds: non-negative integer seconds (e.g. "120")
+/// - HTTP-date: RFC 9110 / RFC 7231 / RFC 2822 date formats (e.g. "Wed, 21 Oct 2025 07:28:00 GMT")
+///
+/// Returns `None` if the value is missing, empty, or unparseable.
+pub fn parse_retry_after(header_val: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    let trimmed = header_val.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. Delta-seconds
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(secs);
+    }
+
+    // 2. HTTP-date: RFC 2822 / RFC 7231 IMF-fixdate (e.g. "Wed, 21 Oct 2025 07:28:00 GMT")
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+        let diff = (date.with_timezone(&chrono::Utc) - now).num_seconds();
+        return Some(diff.max(0) as u64);
+    }
+
+    // 3. Fallbacks for standard HTTP date formats
+    if let Ok(date) = chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT") {
+        let diff = (date.and_utc() - now).num_seconds();
+        return Some(diff.max(0) as u64);
+    }
+    if let Ok(date) = chrono::NaiveDateTime::parse_from_str(trimmed, "%A, %d-%b-%y %H:%M:%S GMT") {
+        let diff = (date.and_utc() - now).num_seconds();
+        return Some(diff.max(0) as u64);
+    }
+    if let Ok(date) = chrono::NaiveDateTime::parse_from_str(trimmed, "%a %b %e %H:%M:%S %Y") {
+        let diff = (date.and_utc() - now).num_seconds();
+        return Some(diff.max(0) as u64);
+    }
+
+    None
+}
+
+/// Calculate the applied delay for a 429 Retry-After response.
+///
+/// Clamps the requested delay to a sensible maximum: `max(poll_interval_seconds * 10, 300)`
+/// (e.g. at most 5 minutes, or 10x the poll interval).
+/// If `Retry-After` is missing or unparseable, falls back to `default_secs`.
+///
+/// Returns `(requested_delay, applied_delay)`.
+pub fn calculate_applied_delay(
+    raw_header: Option<&str>,
+    poll_interval_seconds: Option<u64>,
+    default_secs: u64,
+) -> (Option<u64>, u64) {
+    let now = chrono::Utc::now();
+    let requested = raw_header.and_then(|h| parse_retry_after(h, now));
+    let interval = poll_interval_seconds.unwrap_or(10);
+    let max_delay = (interval * 10).max(300); // 5 minutes or 10x poll_interval
+    let raw_delay = requested.unwrap_or(default_secs);
+    let applied = raw_delay.min(max_delay).max(1);
+    (requested, applied)
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Per-contract mutable state carried across poll cycles.
@@ -768,6 +830,8 @@ pub struct ContractPollState {
     pub no_activity_states: Vec<NoActivityState>,
     /// Suppresses repeated evaluation warnings for broken rules.
     pub suppressor: WarningSuppressor,
+    /// Next time this contract may be polled after a 429 response (#9, #10).
+    pub backoff_until: Option<tokio::time::Instant>,
 }
 
 /// Returns `(transactions_processed, alerts_fired, webhook_failures)`.
@@ -776,8 +840,7 @@ pub struct ContractPollState {
 /// operations inline, eliminating one HTTP request per transaction (#23).
 /// Falls back to a separate `/transactions/{hash}/operations` fetch only when
 /// the inline `operations` array is absent (older Horizon versions).
-#[tracing::instrument(skip(client, contract, cursors, state), fields(
-#[tracing::instrument(skip(client, contract, cursors, cooldowns), fields(
+#[tracing::instrument(skip(client, contract, cursors, state, cooldowns), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str()
@@ -790,6 +853,21 @@ async fn poll_contract(
     cooldowns: &mut CooldownTracker,
     dry_run: bool,
 ) -> Result<(u64, u64, u64)> {
+    // Check if contract is currently backing off from a previous 429 (#9)
+    if let Some(backoff_until) = state.backoff_until {
+        if tokio::time::Instant::now() < backoff_until {
+            let remaining_secs = (backoff_until - tokio::time::Instant::now()).as_secs();
+            debug!(
+                contract = %contract.label,
+                remaining_secs,
+                "Contract is backing off following a 429 response — skipping poll cycle"
+            );
+            return Ok((0, 0, 0));
+        } else {
+            state.backoff_until = None;
+        }
+    }
+
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -827,15 +905,35 @@ async fn poll_contract(
         let response = response.with_context(|| format!("GET {} failed", url))?;
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
+            let raw_header = response
                 .headers()
                 .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return Ok((0, 0, 0));
+                .and_then(|v| v.to_str().ok());
+            let (requested, applied) = calculate_applied_delay(
+                raw_header,
+                contract.poll_interval_seconds,
+                5,
+            );
+            warn!(
+                contract = %contract.label,
+                requested_delay = ?requested,
+                applied_delay = applied,
+                "Horizon returned 429 — backing off"
+            );
+            // Move back-off into per-contract scheduling instead of sleeping inline (#9, #10)
+            state.backoff_until = Some(tokio::time::Instant::now() + Duration::from_secs(applied));
+
+            // On 429 during pagination, stop fetching but keep already-fetched records to advance cursor (#9)
+            if !all_records.is_empty() {
+                info!(
+                    contract = %contract.label,
+                    fetched = all_records.len(),
+                    "429 received during pagination; processing already-fetched records to advance cursor"
+                );
+                break;
+            } else {
+                return Ok((0, 0, 0));
+            }
         }
 
         let status = response.status();
@@ -1734,15 +1832,9 @@ mod tests {
             contract_id: contract_id.into(),
             network: Network::Testnet,
             rules: vec![rule(txwatch_config::AlertRule::AnyTransaction)],
-            rules: vec![txwatch_config::AlertRule::AnyTransaction]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            webhook_url: "https://hooks.example.com/test".into(),
-            rules: vec![txwatch_config::AlertRule::AnyTransaction],
             webhook_url: Some("https://hooks.example.com/test".into()),
             webhook_secret: None,
-            poll_interval_seconds: None,
+            poll_interval_seconds: Some(10),
             enabled: true,
             soroban_rpc_url: None,
             horizon_base_url_override: Some(server.uri()),
@@ -1754,17 +1846,227 @@ mod tests {
         };
 
         // 429 is handled with a back-off and returns Ok((0,0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors, &mut ContractPollState::default(), false).await;
+        let mut state = ContractPollState::default();
+        let mut cooldowns = CooldownTracker::new();
         let result = poll_contract(
             &client,
             &contract,
             &mut cursors,
-            &mut CooldownTracker::new(),
+            &mut state,
+            &mut cooldowns,
             false,
         )
         .await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0, 0));
+        assert!(state.backoff_until.is_some(), "backoff_until must be set on 429");
+    }
+
+    // ── Tests for Issues #9 & #10: Retry-After & Pagination 429 Resilience ─────
+
+    #[test]
+    fn test_parse_retry_after_seconds() {
+        let now = chrono::Utc::now();
+        assert_eq!(parse_retry_after("120", now), Some(120));
+        assert_eq!(parse_retry_after("0", now), Some(0));
+        assert_eq!(parse_retry_after("  3600  ", now), Some(3600));
+        assert_eq!(parse_retry_after("86400", now), Some(86400));
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date() {
+        let now = chrono::Utc::now();
+        let future_time = now + chrono::Duration::seconds(60);
+        let future_rfc2822 = future_time.to_rfc2822();
+        let parsed = parse_retry_after(&future_rfc2822, now);
+        assert!(parsed.is_some());
+        let delay = parsed.unwrap();
+        assert!(delay >= 59 && delay <= 61, "expected ~60s delay, got {}", delay);
+
+        // Past date returns 0
+        let past_time = now - chrono::Duration::seconds(60);
+        let past_rfc2822 = past_time.to_rfc2822();
+        assert_eq!(parse_retry_after(&past_rfc2822, now), Some(0));
+    }
+
+    #[test]
+    fn test_parse_retry_after_garbage() {
+        let now = chrono::Utc::now();
+        assert_eq!(parse_retry_after("garbage", now), None);
+        assert_eq!(parse_retry_after("", now), None);
+        assert_eq!(parse_retry_after("-10", now), None);
+        assert_eq!(parse_retry_after("invalid-http-date", now), None);
+    }
+
+    #[test]
+    fn test_calculate_applied_delay_clamping() {
+        // Unbounded large value (86400 seconds = 1 day) clamped to max (e.g. 10 * 10 = 100 or 300 min)
+        let (requested, applied) = calculate_applied_delay(Some("86400"), Some(10), 5);
+        assert_eq!(requested, Some(86400));
+        assert_eq!(applied, 300, "delay must be clamped to 300 seconds max");
+
+        // Sensible value preserved
+        let (requested, applied) = calculate_applied_delay(Some("45"), Some(10), 5);
+        assert_eq!(requested, Some(45));
+        assert_eq!(applied, 45);
+
+        // Garbage falls back to default 5
+        let (requested, applied) = calculate_applied_delay(Some("not_a_number"), Some(10), 5);
+        assert_eq!(requested, None);
+        assert_eq!(applied, 5);
+
+        // Missing header falls back to default 5
+        let (requested, applied) = calculate_applied_delay(None, Some(10), 5);
+        assert_eq!(requested, None);
+        assert_eq!(applied, 5);
+    }
+
+    #[tokio::test]
+    async fn test_429_during_pagination_processes_already_fetched_page() {
+        let server = MockServer::start().await;
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+        // Generate 200 records for page 1
+        let mut records = Vec::new();
+        for i in 1..=200 {
+            records.push(serde_json::json!({
+                "hash": format!("txhash{:04}", i),
+                "created_at": "2024-06-01T10:00:00Z",
+                "successful": true,
+                "paging_token": format!("token_{}", i),
+                "fee_charged": "100",
+                "envelope_xdr": null,
+                "result_xdr": null,
+                "operations": [
+                    { "type": "invoke_host_function", "function": "transfer" }
+                ]
+            }));
+        }
+
+        let page1 = serde_json::json!({
+            "_embedded": { "records": records }
+        });
+
+        // Page 1 matches initial cursor "now" and returns 200 transactions
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .and(wiremock::matchers::query_param("cursor", "now"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page1))
+            .mount(&server)
+            .await;
+
+        // Page 2 matches cursor "token_200" and returns HTTP 429
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .and(wiremock::matchers::query_param("cursor", "token_200"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label: "pagination_test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            rules: vec![rule(txwatch_config::AlertRule::AnyTransaction)],
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_secret: None,
+            poll_interval_seconds: Some(10),
+            enabled: true,
+            soroban_rpc_url: None,
+            horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+        };
+
+        let mut state = ContractPollState::default();
+        let mut cooldowns = CooldownTracker::new();
+
+        let (txs, alerts, failures) = poll_contract(
+            &client,
+            &contract,
+            &mut cursors,
+            &mut state,
+            &mut cooldowns,
+            true, // dry_run so webhooks don't send
+        )
+        .await
+        .expect("poll_contract should succeed and process page 1");
+
+        // Assert all 200 records from page 1 were processed
+        assert_eq!(txs, 200, "all 200 records from page 1 must be processed");
+        assert_eq!(alerts, 200, "alerts should match processed transactions");
+        assert_eq!(failures, 0);
+
+        // Assert cursor was advanced to the 200th record's paging token
+        assert_eq!(
+            cursors.get(contract_id),
+            Some(&"token_200".to_string()),
+            "cursor must advance to last token of page 1 despite 429 on page 2"
+        );
+
+        // Assert backoff was recorded on state without blocking other contracts
+        assert!(
+            state.backoff_until.is_some(),
+            "backoff_until must be set on contract state after 429"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poll_contract_skips_when_in_backoff() {
+        let server = MockServer::start().await;
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+        let client = Client::new();
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "token_100".to_string());
+
+        let contract = WatchedContract {
+            label: "backoff_test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            rules: vec![rule(txwatch_config::AlertRule::AnyTransaction)],
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_secret: None,
+            poll_interval_seconds: Some(10),
+            enabled: true,
+            soroban_rpc_url: None,
+            horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+        };
+
+        let mut state = ContractPollState::default();
+        // Set backoff to 10 seconds in future
+        state.backoff_until = Some(tokio::time::Instant::now() + Duration::from_secs(10));
+        let mut cooldowns = CooldownTracker::new();
+
+        // poll_contract should return immediately without making any HTTP requests
+        let (txs, alerts, failures) = poll_contract(
+            &client,
+            &contract,
+            &mut cursors,
+            &mut state,
+            &mut cooldowns,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(txs, 0);
+        assert_eq!(alerts, 0);
+        assert_eq!(failures, 0);
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 0, "no requests should be sent while backing off");
     }
 
     #[tokio::test]
