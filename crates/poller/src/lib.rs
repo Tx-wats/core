@@ -360,6 +360,7 @@ async fn poll_contract_forever(
     loop {
         match poll_contract(
             &client,
+            &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut state,
@@ -502,6 +503,7 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
         let mut state = ContractPollState::default();
         match poll_contract(
             &client,
+            &HorizonSource::new(&client, poll_base_url(contract)),
             contract,
             &mut cursors,
             &mut state,
@@ -526,6 +528,179 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
     Ok(report)
 }
 
+// ── Transaction sources ───────────────────────────────────────────────────────
+
+/// The Horizon base URL to poll for `contract`: its override when set, else the
+/// network's own instance.
+pub(crate) fn poll_base_url(contract: &WatchedContract) -> &str {
+    contract
+        .horizon_base_url_override
+        .as_deref()
+        .unwrap_or_else(|| contract.network.horizon_base_url())
+}
+
+/// One page of a contract's transactions.
+pub(crate) struct TransactionPage {
+    /// Records in ascending order, as returned by the source.
+    pub(crate) records: Vec<HorizonTransactionWithOps>,
+    /// Cursor to pass to the next call, or `None` when this is the last page.
+    pub(crate) next_cursor: Option<String>,
+}
+
+/// Where a contract's transactions come from.
+///
+/// Only [`HorizonSource`] exists today. Soroban RPC cannot implement this as it
+/// stands: it offers no way to enumerate the transactions a contract took part
+/// in — only the events it emitted — so a reverted invocation is invisible to
+/// it, and it has no `pagingToken` to advance a cursor with. See issue #4 for
+/// the measurements and for why adding an RPC source is not a drop-in.
+pub(crate) trait TransactionSource {
+    /// Fetch the page of transactions after `cursor`, oldest first.
+    ///
+    /// Returning `Ok(None)` means the source cannot serve this contract at all
+    /// (for example a Horizon account endpoint rejecting a contract address).
+    async fn fetch_page(
+        &self,
+        contract: &WatchedContract,
+        cursor: &str,
+    ) -> Result<Option<TransactionPage>>;
+}
+
+/// Horizon's transaction collection endpoint.
+///
+/// The `/accounts/{id}` routes only accept G-addresses, so this source cannot
+/// serve a contract (C…) address: Horizon answers HTTP 400
+/// ("Account ID must start with `G`"). That is the bug in issue #4, and it is
+/// why this is behind a trait rather than being the only way in.
+pub(crate) struct HorizonSource<'a> {
+    client: &'a Client,
+    /// Base URL of the Horizon instance, e.g. `https://horizon-testnet.stellar.org`.
+    base_url: &'a str,
+    /// Page size requested from Horizon.
+    limit: usize,
+}
+
+/// Horizon's own maximum page size for this endpoint.
+const HORIZON_PAGE_LIMIT: usize = 200;
+
+/// The error for a non-success Horizon response, carrying the reason from the
+/// body when Horizon sent one.
+fn horizon_http_error(status: reqwest::StatusCode, url: &str, body: &str) -> anyhow::Error {
+    // `extras` names both the offending field and why it was refused, which is
+    // the part an operator actually needs; `detail` is only a generic blurb.
+    let explanation = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .map(|v| {
+            let field = v
+                .pointer("/extras/invalid_field")
+                .and_then(serde_json::Value::as_str);
+            let reason = v
+                .pointer("/extras/reason")
+                .and_then(serde_json::Value::as_str);
+            match (field, reason) {
+                (Some(field), Some(reason)) => format!("{field}: {reason}"),
+                (Some(field), None) => field.to_owned(),
+                (None, Some(reason)) => reason.to_owned(),
+                (None, None) => v
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(String::new, str::to_owned),
+            }
+        })
+        .filter(|explanation| !explanation.is_empty());
+    match explanation {
+        Some(explanation) => {
+            anyhow::anyhow!("Horizon returned HTTP {status} for {url}: {explanation}")
+        }
+        None => anyhow::anyhow!("Horizon returned HTTP {status} for {url}"),
+    }
+}
+
+impl<'a> HorizonSource<'a> {
+    pub(crate) fn new(client: &'a Client, base_url: &'a str) -> Self {
+        Self {
+            client,
+            base_url,
+            limit: HORIZON_PAGE_LIMIT,
+        }
+    }
+}
+
+impl TransactionSource for HorizonSource<'_> {
+    async fn fetch_page(
+        &self,
+        contract: &WatchedContract,
+        cursor: &str,
+    ) -> Result<Option<TransactionPage>> {
+        // Issue #2: `include_failed=true` is required or Horizon only returns
+        // successful transactions, which makes `TransactionFailed` dead.
+        // Issue #23: `join=operations` returns operations inline, avoiding one
+        // HTTP request per transaction.
+        let url = format!(
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit={}&join=operations&include_failed=true",
+            self.base_url, contract.contract_id, cursor, self.limit
+        );
+
+        #[cfg(feature = "metrics")]
+        let started = std::time::Instant::now();
+        let response = self.client.get(&url).send().await;
+        #[cfg(feature = "metrics")]
+        metrics::observe_horizon_request(
+            contract.network.as_str(),
+            started.elapsed().as_secs_f64(),
+        );
+        let response = response.with_context(|| format!("GET {} failed", url))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
+            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            return Ok(Some(TransactionPage {
+                records: Vec::new(),
+                next_cursor: None,
+            }));
+        }
+
+        let status = response.status();
+        if !status.is_success() {
+            // Horizon explains a rejection in the body, not the status line.
+            // Without it a contract address refused for not starting with `G`
+            // is indistinguishable from any other 400 in the logs, which is
+            // what made issue #4 hard to diagnose.
+            let body = response.text().await.unwrap_or_default();
+            return Err(horizon_http_error(status, &url, &body));
+        }
+
+        let page: HorizonPage = response
+            .json()
+            .await
+            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+
+        let records = page._embedded.records;
+        if records.is_empty() {
+            return Ok(Some(TransactionPage {
+                records,
+                next_cursor: None,
+            }));
+        }
+        // A short page is the last one; otherwise continue from its last token.
+        let next_cursor = if records.len() < self.limit {
+            None
+        } else {
+            records.last().map(|r| r.tx.paging_token.clone())
+        };
+        Ok(Some(TransactionPage {
+            records,
+            next_cursor,
+        }))
+    }
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Per-contract mutable state carried across poll cycles.
@@ -547,13 +722,14 @@ pub struct ContractPollState {
 /// operations inline, eliminating one HTTP request per transaction (#23).
 /// Falls back to a separate `/transactions/{hash}/operations` fetch only when
 /// the inline `operations` array is absent (older Horizon versions).
-#[tracing::instrument(skip(client, contract, cursors, state, cooldowns), fields(
+#[tracing::instrument(skip(client, source, contract, cursors, state, cooldowns), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str()
 ))]
-async fn poll_contract(
+async fn poll_contract<S: TransactionSource + ?Sized>(
     client: &Client,
+    source: &S,
     contract: &WatchedContract,
     cursors: &mut HashMap<String, String>,
     state: &mut ContractPollState,
@@ -568,10 +744,7 @@ async fn poll_contract(
     // `poll_base` is used for all Horizon HTTP requests (may be overridden in tests).
     // `canonical_base` is always the production Horizon URL and is used only for
     // building horizon_link in payloads, so links always point to the real network.
-    let poll_base = contract
-        .horizon_base_url_override
-        .as_deref()
-        .unwrap_or_else(|| contract.network.horizon_base_url());
+    let poll_base = poll_base_url(contract);
     let canonical_base = contract.network.horizon_base_url();
 
     // Collect all pages of transactions.
@@ -579,61 +752,20 @@ async fn poll_contract(
     let mut page_cursor = cursor.clone();
 
     loop {
-        // Issue #23: use join=operations to fetch operations inline, eliminating
-        // one HTTP request per transaction.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
-            poll_base, contract.contract_id, page_cursor
-        );
-
-        #[cfg(feature = "metrics")]
-        let started = std::time::Instant::now();
-        let response = client.get(&url).send().await;
-        #[cfg(feature = "metrics")]
-        metrics::observe_horizon_request(
-            contract.network.as_str(),
-            started.elapsed().as_secs_f64(),
-        );
-        let response = response.with_context(|| format!("GET {} failed", url))?;
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return Ok((0, 0, 0));
-        }
-
-        let status = response.status();
-        let page: HorizonPage = response
-            .error_for_status()
-            .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
-            .json()
-            .await
-            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
-        if records.is_empty() {
+        let Some(page) = source.fetch_page(contract, &page_cursor).await? else {
+            warn!(
+                contract = %contract.label,
+                "no transaction source can serve this contract; see issue #4"
+            );
+            break;
+        };
+        if page.records.is_empty() {
             break;
         }
-
-        let last_token = records.last().map(|r| r.tx.paging_token.clone());
-        let count = records.len();
-        for r in records {
-            all_records.push(r);
-        }
-
-        if count < 200 {
-            break;
-        }
-        if let Some(token) = last_token {
-            page_cursor = token;
-        } else {
-            break;
+        all_records.extend(page.records);
+        match page.next_cursor {
+            Some(next) => page_cursor = next,
+            None => break,
         }
     }
 
@@ -1289,6 +1421,7 @@ mod tests {
 
         let (txs, alerts, _) = poll_contract(
             &client,
+            &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
@@ -1423,6 +1556,7 @@ mod tests {
         // 429 is handled with a back-off and returns Ok((0,0,0)), not an error
         let result = poll_contract(
             &client,
+            &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
@@ -1468,6 +1602,7 @@ mod tests {
 
         let err = poll_contract(
             &client,
+            &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
@@ -1480,6 +1615,63 @@ mod tests {
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}",
             err
+        );
+    }
+
+    /// Issue #4: Horizon's `/accounts/{id}` routes only accept G-addresses, so a
+    /// watched contract (C…) is rejected with HTTP 400 naming `account_id` as the
+    /// offending field. Pinning the text keeps this diagnosable from logs instead
+    /// of looking like a contract that simply has no activity.
+    #[tokio::test]
+    async fn horizon_c_address_rejection_names_the_account_id_field() {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/horizon_c_address_transactions_400.json"
+        ))
+        .expect("recorded Horizon error is valid JSON");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(recorded))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label: "test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            rules: vec![rule(txwatch_config::AlertRule::AnyTransaction)],
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            enabled: true,
+            soroban_rpc_url: None,
+            horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+        };
+
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
+        // `TransactionPage` is not `Debug`, so match rather than `expect_err`.
+        let Err(err) = source.fetch_page(&contract, "now").await else {
+            panic!("Horizon cannot serve a C-address on the accounts endpoint");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("400"),
+            "error must contain HTTP status 400, got: {msg}"
+        );
+        assert!(
+            msg.contains("account_id"),
+            "error must name the rejected field, got: {msg}"
         );
     }
 
@@ -1517,6 +1709,7 @@ mod tests {
 
         let result = poll_contract(
             &client,
+            &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
@@ -1771,6 +1964,7 @@ mod tests {
         // delivering 201 alerts to an unmocked endpoint would retry each one.
         let (txs, alerts, failures) = poll_contract(
             &client,
+            &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
@@ -1971,6 +2165,7 @@ mod tests {
 
         let (_, alerts, failures) = poll_contract(
             &client,
+            &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut state,
@@ -2069,8 +2264,11 @@ mod tests {
         let contract = batching_contract(&server, &receiver, 3).await;
         let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
 
+        let client = Client::new();
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
         let (txs, alerts, failures) = poll_contract(
-            &Client::new(),
+            &client,
+            &source,
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
@@ -2090,8 +2288,11 @@ mod tests {
         let contract = batching_contract(&server, &receiver, 120).await;
         let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
 
+        let client = Client::new();
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
         let (_, alerts, _) = poll_contract(
-            &Client::new(),
+            &client,
+            &source,
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
@@ -2109,8 +2310,11 @@ mod tests {
         let (server, receiver) = (MockServer::start().await, MockServer::start().await);
         let contract = batching_contract(&server, &receiver, 3).await;
         let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+        let client = Client::new();
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
         poll_contract(
-            &Client::new(),
+            &client,
+            &source,
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
@@ -2124,8 +2328,11 @@ mod tests {
         let (server, receiver) = (MockServer::start().await, MockServer::start().await);
         let contract = batching_contract(&server, &receiver, 0).await;
         let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+        let client = Client::new();
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
         poll_contract(
-            &Client::new(),
+            &client,
+            &source,
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
