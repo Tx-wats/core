@@ -10,9 +10,9 @@
 mod helpers;
 
 use reqwest::Client;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use txwatch_config::{AlertRule, AppConfig};
@@ -73,6 +73,7 @@ async fn run_polls_once_and_fires_webhook() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -144,6 +145,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -189,6 +191,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -704,6 +707,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -769,6 +773,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -846,6 +851,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -943,6 +949,7 @@ async fn contracts_polled_concurrently() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
         cursor_file: None,
     };
 
@@ -1016,6 +1023,7 @@ async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1106,6 +1114,7 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;
@@ -1153,6 +1162,87 @@ async fn horizon_rejects_a_contract_address_on_the_accounts_endpoint() {
 
     let mut contract =
         helpers::contract("https://example.com/hook", vec![AlertRule::AnyTransaction]);
+/// Issue #5: the cursor file was read on startup but never written, so a
+/// restart replayed every transaction since the original cursor. This drives
+/// the real polling loop, then reads the file back and asserts the paging token
+/// that was actually served.
+#[tokio::test]
+async fn cursor_file_is_persisted_after_a_poll_cycle() {
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // One transaction on the first cycle, then empty pages.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::tx_page(
+            "run001",
+            "cursor-tok-1",
+            true,
+        )))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/transactions/run001/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let cursor_file = std::env::temp_dir().join(format!(
+        "txwatch_cursor_test_{}_{}.json",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&cursor_file);
+    assert!(
+        !cursor_file.exists(),
+        "cursor file must not pre-exist: {}",
+        cursor_file.display()
+    );
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract.clone()],
+        cursor_file: Some(cursor_file.display().to_string()),
+/// Issue #2: Horizon's transaction collection endpoints omit failed
+/// transactions unless `include_failed=true` is passed, which made the
+/// `TransactionFailed` rule unreachable in production. The matcher below only
+/// matches when the parameter is present, so the poll cannot succeed without
+/// it; the recorded request is then asserted explicitly.
+#[tokio::test]
+async fn transactions_request_includes_failed() {
+    let horizon = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .and(query_param("include_failed", "true"))
+        .and(query_param("join", "operations"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(helpers::tx_page("fail001", "77", false)),
+        )
+        .mount(&horizon)
+        .await;
+
+    let mut contract = helpers::contract(
+        "https://example.com/hook",
+        vec![AlertRule::TransactionFailed],
+    );
     contract.horizon_base_url_override = Some(horizon.uri());
     let cfg = AppConfig {
         poll_interval_seconds: 3600,
@@ -1177,4 +1267,65 @@ async fn horizon_rejects_a_contract_address_on_the_accounts_endpoint() {
         "the rejected contract must be counted as a poll failure"
     );
     assert!(!report.is_success());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run =
+        tokio::spawn(
+            async move { txwatch_poller::run_with_shutdown(cfg, true, shutdown_rx).await },
+        );
+
+    // Wait for the first cycle to persist its cursor.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let raw = loop {
+        if let Ok(text) = std::fs::read_to_string(&cursor_file) {
+            if text.contains("cursor-tok-1") {
+                break text;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cursor file never contained the served paging token: {}",
+            cursor_file.display()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let persisted: serde_json::Value = serde_json::from_str(&raw).expect("cursor file is JSON");
+    assert_eq!(
+        persisted[&contract.contract_id], "cursor-tok-1",
+        "the served paging token must be persisted"
+    );
+    // Atomic write: no temp file is left behind.
+    let tmp = cursor_file.with_extension("tmp");
+    assert!(!tmp.exists(), "temp file {} was left behind", tmp.display());
+
+    shutdown_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+    let _ = std::fs::remove_file(&cursor_file);
+    // Dry run: this asserts the request we send, not the delivery path.
+    let report = txwatch_poller::run_once(cfg, true).await.unwrap();
+    assert_eq!(
+        report.poll_failures, 0,
+        "the request must have matched the mock"
+    );
+    assert_eq!(
+        report.transactions, 1,
+        "the failed transaction must be seen"
+    );
+
+    let requests = horizon.received_requests().await.unwrap();
+    let all: Vec<String> = requests.iter().map(|r| r.url.to_string()).collect();
+    // Only the collection endpoint carries this parameter; the
+    // per-transaction `/operations` fallback is a different endpoint.
+    let collection: Vec<&String> = all
+        .iter()
+        .filter(|u| u.contains("/accounts/") && u.contains("/transactions?"))
+        .collect();
+    assert!(
+        !collection.is_empty(),
+        "expected a transactions collection request, got {all:?}"
+    );
+    assert!(
+        collection.iter().all(|u| u.contains("include_failed=true")),
+        "every transactions request must carry include_failed=true, got {collection:?}"
+    );
 }

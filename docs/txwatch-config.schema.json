@@ -9,6 +9,7 @@
     "http_pool_max_idle_per_host": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
     "http_tcp_keepalive_secs": { "type": "integer", "minimum": 0, "maximum": 7200, "default": 30 },
     "http_connection_verbose": { "type": ["boolean", "null"] },
+    "max_pages_per_cycle": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000, "description": "Maximum Horizon pages (200 transactions each) fetched per contract in one poll cycle. Default: 10." },
     "max_contracts": { "type": ["integer", "null"], "minimum": 1, "maximum": 10000, "description": "Maximum number of [[contracts]] entries. Default: 100." },
     "contracts": { "type": "array", "items": { "$ref": "#/definitions/WatchedContract" }, "minItems": 1 }
   },

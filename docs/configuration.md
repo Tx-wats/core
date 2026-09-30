@@ -25,11 +25,12 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | Field                         | Type            | Required | Default | Description |
 |-------------------------------|-----------------|----------|---------|-------------|
 | `poll_interval_seconds`       | u64             | no       | `10`    | How often to poll Horizon (seconds). Must be ≥ 5 and ≤ 3600. Each contract can override it (see below). |
-| `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique (case-insensitive). |
-| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. |
+| `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique (case-insensitive), and each `(network, contract_id)` pair may appear only once. |
+| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. Cursors are keyed `<network>:<contract_id>`; a file written by an older version (keyed by bare contract ID) is migrated automatically, except for a contract ID watched on several networks, which starts from `now`. |
 | `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
 | `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
+| `max_pages_per_cycle`         | usize           | no       | `10`    | Maximum Horizon pages (200 transactions each) fetched per contract in one poll cycle. Must be 1–1000. Pages are processed as they arrive; when the cap is hit a warning is logged and the next cycle continues from the saved cursor. |
 | `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 
 Unknown top-level keys are rejected.
@@ -40,6 +41,14 @@ Unknown top-level keys are rejected.
 > `poll_interval_seconds = 10`; for high-volume deployments with many contracts, `poll_interval_seconds = 30` or
 > higher is advised. TxWatch logs a startup warning when more than 5 contracts are polled at an effective
 > interval below 10 seconds.
+>
+> **Poll staggering:** each contract polls on its own fixed-period schedule. The first poll of a contract happens
+> immediately at startup; every later poll is shifted by a deterministic per-contract offset of up to 10% of the
+> contract's poll interval, so contracts do not all hit Horizon at the same instant every cycle. Set the
+> `TXWATCH_POLL_JITTER_PERCENT` environment variable to change the percentage (clamped to 100); `0` disables the
+> offset. A contract that keeps failing is polled less often (the delay doubles per consecutive failure, capped at
+> 10 minutes), is reported once as unhealthy after 5 consecutive failures, and is reported once as recovered on its
+> next success. `txwatch_consecutive_poll_failures` exposes the failure streak.
 
 > **Contract limit:** a configuration may hold at most `max_contracts` (default `100`, `MAX_CONTRACTS` in `txwatch-config`) `[[contracts]]` entries; more is rejected at startup. Every contract is polled by its own task, so very large lists can exhaust memory, file descriptors or the public Horizon rate limit. Split large deployments across several TxWatch instances, or raise `max_contracts` (up to 10000) when polling your own Horizon.
 
