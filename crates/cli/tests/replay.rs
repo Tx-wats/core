@@ -54,7 +54,11 @@ async fn horizon_with_admin_call() -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "_embedded": { "records": [{
                 "type":     "invoke_host_function",
-                "function": "set_admin"
+                "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+                "parameters": [{
+                    "type": "Sym",
+                    "value": "AAAADwAAAAlzZXRfYWRtaW4="
+                }]
             }] }
         })))
         .mount(&horizon)

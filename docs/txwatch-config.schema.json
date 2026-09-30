@@ -28,7 +28,6 @@
             "properties": { "horizon_url": { "type": "string", "format": "uri" }, "explorer_url": { "type": ["string", "null"], "format": "uri" }, "passphrase": { "type": ["string", "null"] } } }
         ] },
         "webhook_url": { "type": "string", "format": "uri", "description": "Shorthand for a single destination; described by the webhook_* fields." },
-        ] }, "webhook_url": { "type": "string", "format": "uri" },
         "webhook_secret": { "type": ["string", "null"] },
         "webhook_format": { "$ref": "#/definitions/WebhookFormat" },
         "webhook_headers": { "$ref": "#/definitions/WebhookHeaders" },

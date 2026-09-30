@@ -112,7 +112,7 @@ async fn once_delivers_alert_saves_cursor_and_exits_zero() {
         serde_json::from_str(&fs::read_to_string(&cursor_path).expect("cursor file written"))
             .unwrap();
     assert_eq!(
-        cursors["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"],
+        cursors["testnet:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"],
         "700"
     );
 }

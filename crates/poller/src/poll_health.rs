@@ -52,7 +52,8 @@ pub(crate) fn start_offset(contract_id: &str, interval: Duration, percent: u64) 
 /// cycle that overruns the interval delays the next tick instead of
 /// bursting to catch up, so the period never drifts below `interval`.
 pub(crate) fn poll_ticker(interval: Duration, offset: Duration) -> tokio::time::Interval {
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval + offset, interval);
+    let mut ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + interval + offset, interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker
 }
@@ -167,7 +168,10 @@ mod tests {
         let distinct: std::collections::HashSet<_> = (0..20)
             .map(|i| start_offset(&format!("CONTRACT_{i}"), interval, 10))
             .collect();
-        assert!(distinct.len() > 1, "offsets should differ between contracts");
+        assert!(
+            distinct.len() > 1,
+            "offsets should differ between contracts"
+        );
     }
 
     /// The period between ticks must equal the configured interval even though

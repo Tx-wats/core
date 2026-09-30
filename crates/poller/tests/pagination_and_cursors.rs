@@ -86,7 +86,11 @@ fn contract_toml(label: &str, id: &str, network: &str) -> String {
 
 /// Parses a config; `servers[i]` becomes contract `i`'s Horizon endpoint.
 fn config(toml: &str, cursor_file: &Path, servers: &[&MockServer]) -> AppConfig {
-    let raw = format!("cursor_file = {:?}\n{}", cursor_file.display().to_string(), toml);
+    let raw = format!(
+        "cursor_file = {:?}\n{}",
+        cursor_file.display().to_string(),
+        toml
+    );
     let mut cfg = AppConfig::parse(&raw, Path::new("test.toml")).unwrap();
     for (contract, server) in cfg.contracts.iter_mut().zip(servers) {
         contract.horizon_base_url_override = Some(server.uri());
@@ -111,13 +115,19 @@ async fn page_cap_stops_the_cycle_and_the_next_cycle_resumes() {
         .await
         .unwrap();
     assert_eq!(requested_cursors(&server).await, vec!["now"]);
-    assert_eq!(read_cursors(&file).get(&key).map(String::as_str), Some("200"));
+    assert_eq!(
+        read_cursors(&file).get(&key).map(String::as_str),
+        Some("200")
+    );
 
     txwatch_poller::run_once(config(&toml, &file, &[&server]), true)
         .await
         .unwrap();
     assert_eq!(requested_cursors(&server).await, vec!["now", "200"]);
-    assert_eq!(read_cursors(&file).get(&key).map(String::as_str), Some("201"));
+    assert_eq!(
+        read_cursors(&file).get(&key).map(String::as_str),
+        Some("201")
+    );
 }
 
 #[tokio::test]
@@ -134,7 +144,10 @@ async fn default_cap_reads_further_pages_in_one_cycle() {
 
     assert_eq!(requested_cursors(&server).await, vec!["now", "200"]);
     let key = format!("testnet:{ID}");
-    assert_eq!(read_cursors(&file).get(&key).map(String::as_str), Some("201"));
+    assert_eq!(
+        read_cursors(&file).get(&key).map(String::as_str),
+        Some("201")
+    );
 }
 
 #[tokio::test]
@@ -162,8 +175,14 @@ async fn cursors_are_kept_per_network_for_the_same_contract_id() {
     assert_eq!(requested_cursors(&testnet).await, vec!["111"]);
     assert_eq!(requested_cursors(&futurenet).await, vec!["222"]);
     let saved = read_cursors(&file);
-    assert_eq!(saved.get(&format!("testnet:{ID}")).map(String::as_str), Some("112"));
-    assert_eq!(saved.get(&format!("futurenet:{ID}")).map(String::as_str), Some("223"));
+    assert_eq!(
+        saved.get(&format!("testnet:{ID}")).map(String::as_str),
+        Some("112")
+    );
+    assert_eq!(
+        saved.get(&format!("futurenet:{ID}")).map(String::as_str),
+        Some("223")
+    );
 }
 
 #[tokio::test]
@@ -182,8 +201,14 @@ async fn legacy_cursor_file_is_migrated_to_network_keys() {
 
     assert_eq!(requested_cursors(&server).await, vec!["500"]);
     let saved = read_cursors(&file);
-    assert_eq!(saved.get(&format!("testnet:{ID}")).map(String::as_str), Some("501"));
-    assert!(!saved.contains_key(ID), "legacy key must not be written back");
+    assert_eq!(
+        saved.get(&format!("testnet:{ID}")).map(String::as_str),
+        Some("501")
+    );
+    assert!(
+        !saved.contains_key(ID),
+        "legacy key must not be written back"
+    );
 }
 
 #[tokio::test]

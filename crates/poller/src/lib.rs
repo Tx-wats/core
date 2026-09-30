@@ -46,7 +46,7 @@ pub use metrics::serve_metrics;
 // ── Horizon response shapes ───────────────────────────────────────────────────
 
 /// Horizon operation record — we only need the fields relevant to Soroban.
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct HorizonOperation {
     #[serde(rename = "type")]
     op_type: String,
@@ -59,9 +59,6 @@ struct HorizonOperation {
     /// is the invoked contract function name.
     #[serde(default)]
     parameters: Vec<HorizonParameter>,
-    /// Present on `payment` operations (string, e.g. "1000.0000000").
-    /// Present on `invoke_host_function` operations.
-    function: Option<String>,
     /// Present on `payment` operations (string, e.g. "1000.0000000"). On path
     /// payments this is the amount the destination receives.
     amount: Option<String>,
@@ -142,7 +139,6 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A Horizon transaction record that may include inline operations via `join=operations`.
 /// One entry of `asset_balance_changes` on an `invoke_host_function` operation.
 #[derive(Deserialize)]
 struct AssetBalanceChange {
@@ -150,15 +146,6 @@ struct AssetBalanceChange {
     change_type: String,
     amount: Option<String>,
     asset_type: Option<String>,
-    /// Present on `payment` operations: `native`, `credit_alphanum4` or
-    /// `credit_alphanum12`. Only `native` payments count as XLM.
-    asset_type: Option<String>,
-    /// Present on non-native `payment` operations.
-    #[allow(dead_code)]
-    asset_code: Option<String>,
-    /// Present on non-native `payment` operations.
-    #[allow(dead_code)]
-    asset_issuer: Option<String>,
 }
 
 /// A Horizon transaction record from the account transactions endpoint.
@@ -166,6 +153,8 @@ struct AssetBalanceChange {
 struct HorizonTransactionWithOps {
     #[serde(flatten)]
     tx: HorizonTransaction,
+    #[serde(default)]
+    operations: Vec<HorizonOperation>,
 }
 
 #[derive(Deserialize)]
@@ -415,10 +404,6 @@ pub async fn run_with_reload(
             }
             let interval =
                 Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
-            let cursor = cursors
-                .get(&contract.cursor_key())
-                .cloned()
-                .unwrap_or_else(|| "now".to_string());
             tasks.spawn(poll_contract_forever(
                 client.clone(),
                 contract.clone(),
@@ -443,10 +428,8 @@ pub async fn run_with_reload(
         let _ = stop_tx.send(true);
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((contract_id, cursor)) => {
-                    lock(&cursors).insert(contract_id, cursor);
                 Ok((key, cursor)) => {
-                    cursors.insert(key, cursor);
+                    lock(&cursors).insert(key, cursor);
                 }
                 Err(e) => error!(error = ?e, "contract polling task panicked"),
             }
@@ -465,12 +448,8 @@ pub async fn run_with_reload(
             .contracts
             .iter()
             .map(|c| {
-                let id = c.contract_id.clone();
-                let cursor = lock(&cursors)
-                    .get(&id)
-                    .or_else(|| start.get(&id))
                 let key = c.cursor_key();
-                let cursor = cursors
+                let cursor = lock(&cursors)
                     .get(&key)
                     .or_else(|| start.get(&key))
                     .cloned()
@@ -532,17 +511,13 @@ async fn poll_contract_forever(
     mut stop: watch::Receiver<bool>,
     persist: CursorPersistence,
 ) -> (String, String) {
-    let contract_id = contract.contract_id.clone();
+    let key = contract.cursor_key();
     let cursor = lock(&persist.cursors)
-        .get(&contract_id)
+        .get(&key)
         .cloned()
         .unwrap_or_else(|| "now".to_string());
-    let mut cursors = HashMap::from([(contract_id.clone(), cursor)]);
-    let key = contract.cursor_key();
     let mut cursors = HashMap::from([(key.clone(), cursor)]);
     // Poll state and cooldowns live as long as this contract's task.
-    let mut state = ContractPollState::default();
-    let mut cursors = HashMap::from([(contract.contract_id.clone(), cursor)]);
     let mut state = ContractPollState::default();
     // A single tracker for this contract's lifetime, so cooldowns survive
     // across poll cycles rather than deduping only within one.
@@ -569,8 +544,6 @@ async fn poll_contract_forever(
         .await
         {
             Ok((txs, alerts, _webhook_failures, skipped)) => {
-                counters.record_poll(txs, alerts, skipped);
-            Ok((txs, alerts, _webhook_failures)) => {
                 if let Some(failures) = health.record_success() {
                     info!(
                         contract = %contract.label,
@@ -580,14 +553,7 @@ async fn poll_contract_forever(
                         "contract recovered"
                     );
                 }
-                counters.transactions.fetch_add(txs, Ordering::Relaxed);
-                counters.alerts.fetch_add(alerts, Ordering::Relaxed);
-                counters
-                    .interval_transactions
-                    .fetch_add(txs, Ordering::Relaxed);
-                counters
-                    .interval_alerts
-                    .fetch_add(alerts, Ordering::Relaxed);
+                counters.record_poll(txs, alerts, skipped);
                 // Issue #25: increment Prometheus counters when metrics feature is enabled.
                 #[cfg(feature = "metrics")]
                 {
@@ -601,10 +567,10 @@ async fn poll_contract_forever(
                 // Issue #5: persist the cursor as soon as it advances, so a
                 // restart does not replay transactions we have already seen.
                 if let Some(path) = &persist.path {
-                    if let Some(latest) = cursors.get(&contract_id) {
+                    if let Some(latest) = cursors.get(&key) {
                         let mut guard = lock(&persist.cursors);
-                        if guard.get(&contract_id) != Some(latest) {
-                            guard.insert(contract_id.clone(), latest.clone());
+                        if guard.get(&key) != Some(latest) {
+                            guard.insert(key.clone(), latest.clone());
                             if let Err(e) = write_cursor_file(path, &guard) {
                                 error!(
                                     contract = %contract.label, error = %e,
@@ -679,16 +645,6 @@ fn read_saved_cursors(path: &str) -> HashMap<String, String> {
             HashMap::new()
         }
     }
-        }
-    }
-
-    (
-        contract.contract_id.clone(),
-        cursors
-            .get(&contract.contract_id)
-            .cloned()
-            .unwrap_or_else(|| "now".to_string()),
-    )
 }
 
 /// Resolves the saved cursor map against the configured contracts.
@@ -870,7 +826,6 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
         .await
         {
             Ok((txs, alerts, webhook_failures, _skipped)) => {
-            Ok((txs, alerts, webhook_failures)) => {
                 report.transactions += txs;
                 report.alerts += alerts;
                 report.webhook_failures += webhook_failures;
@@ -939,8 +894,6 @@ pub(crate) struct HorizonSource<'a> {
 }
 
 /// Horizon's own maximum page size for this endpoint.
-const HORIZON_PAGE_LIMIT: usize = 200;
-
 /// The error for a non-success Horizon response, carrying the reason from the
 /// body when Horizon sent one.
 fn horizon_http_error(status: reqwest::StatusCode, url: &str, body: &str) -> anyhow::Error {
@@ -995,14 +948,12 @@ fn retry_after_delay(value: Option<&str>, now: DateTime<Utc>) -> (Option<Duratio
             .ok()
             .map(Duration::from_secs)
             .or_else(|| {
-                DateTime::parse_from_rfc2822(value)
-                    .ok()
-                    .map(|date| {
-                        date.with_timezone(&Utc)
-                            .signed_duration_since(now)
-                            .to_std()
-                            .unwrap_or(Duration::ZERO)
-                    })
+                DateTime::parse_from_rfc2822(value).ok().map(|date| {
+                    date.with_timezone(&Utc)
+                        .signed_duration_since(now)
+                        .to_std()
+                        .unwrap_or(Duration::ZERO)
+                })
             })
     });
     let applied = requested
@@ -1109,20 +1060,16 @@ pub struct ContractPollState {
 
 /// Returns `(transactions_processed, alerts_fired, webhook_failures, transactions_skipped)`.
 ///
-/// Operations are fetched per transaction from `/transactions/{hash}/operations`;
-/// see the note on the transactions URL below for why they are not joined inline.
-#[tracing::instrument(skip(client, contract, cursors, state), fields(
-#[tracing::instrument(skip(client, contract, cursors, cooldowns), fields(
 /// Uses `join=operations` on the transactions endpoint so that Horizon returns
 /// operations inline, eliminating one HTTP request per transaction (#23).
 /// Falls back to a separate `/transactions/{hash}/operations` fetch only when
 /// the inline `operations` array is absent (older Horizon versions).
-#[tracing::instrument(skip(client, source, contract, cursors, state, cooldowns), fields(
 ///
 /// Pages are processed as they arrive rather than buffered, and at most
 /// `max_pages` pages (200 transactions each) are fetched per call. When the cap
 /// is hit a warning is logged and the next call resumes from the saved cursor.
-#[tracing::instrument(skip(client, contract, cursors, state, cooldowns), fields(
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(client, source, contract, cursors, state, cooldowns), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str()
@@ -1148,87 +1095,6 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     // building horizon_link in payloads, so links always point to the real network.
     let poll_base = poll_base_url(contract);
     let canonical_base = contract.network.horizon_base_url();
-
-    // Collect all pages of transactions.
-    let mut all_records: Vec<HorizonTransactionWithOps> = Vec::new();
-    let mut page_cursor = cursor.clone();
-
-    loop {
-        let Some(page) = source.fetch_page(contract, &page_cursor).await? else {
-            warn!(
-                contract = %contract.label,
-                "no transaction source can serve this contract; see issue #4"
-            );
-        // Issue #23: use join=operations to fetch operations inline, eliminating
-        // one HTTP request per transaction.
-        // Issue #2: `include_failed=true` is required or Horizon only returns
-        // successful transactions, which makes `TransactionFailed` dead.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations&include_failed=true",
-        // Checked against horizon-testnet.stellar.org: `join=operations` on the
-        // transactions endpoint is NOT supported. Horizon answers 200 but ignores
-        // it and returns no `operations` array (only `join=transactions` exists,
-        // on operation/payment/effect collections). Operations are therefore
-        // fetched per transaction; see `fetch_soroban_details`.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200",
-            poll_base, contract.contract_id, page_cursor
-        );
-
-        #[cfg(feature = "metrics")]
-        let started = std::time::Instant::now();
-        let response = client.get(&url).send().await;
-        #[cfg(feature = "metrics")]
-        metrics::observe_horizon_request(
-            contract.network.as_str(),
-            started.elapsed().as_secs_f64(),
-        );
-        let response = response.with_context(|| format!("GET {} failed", url))?;
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok());
-            let (requested_delay, applied_delay) = retry_after_delay(retry_after, Utc::now());
-            warn!(
-                contract = %contract.label,
-                retry_after = ?retry_after,
-                requested_delay = ?requested_delay,
-                applied_delay_secs = applied_delay.as_secs(),
-                "Horizon returned 429 — backing off"
-            );
-            tokio::time::sleep(applied_delay).await;
-            return Ok((0, 0, 0));
-        }
-
-        let status = response.status();
-        let page: HorizonPage = response
-            .error_for_status()
-            .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
-            .json()
-            .await
-            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
-        if records.is_empty() {
-            break;
-        };
-        if page.records.is_empty() {
-            break;
-        }
-        all_records.extend(page.records);
-        match page.next_cursor {
-            Some(next) => page_cursor = next,
-            None => break,
-        }
-    }
-
-    if !all_records.is_empty() {
-        info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
-    } else {
-        debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
-    }
 
     let mut tx_count = 0u64;
     let mut alert_count = 0u64;
@@ -1263,57 +1129,27 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             break;
         }
 
-        // Issue #23: use join=operations to fetch operations inline, eliminating
-        // one HTTP request per transaction.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit={}&join=operations",
-            poll_base, contract.contract_id, page_cursor, HORIZON_PAGE_LIMIT
-        );
-        let records = match fetch_transactions_page(client, contract, &url).await {
-            Ok(PageFetch::Records(records)) => records,
-            Ok(PageFetch::RateLimited {
-                requested_delay,
-                applied_delay,
-            }) => {
+        let page = match source.fetch_page(contract, &page_cursor).await {
+            Ok(Some(page)) => page,
+            Ok(None) => {
                 warn!(
                     contract = %contract.label,
-                    requested_delay = ?requested_delay,
-                    applied_delay_secs = applied_delay.as_secs(),
-                    "Horizon returned 429 — backing off"
+                    "no transaction source can serve this contract; see issue #4"
                 );
-                tokio::time::sleep(applied_delay).await;
                 break;
             }
-            // Nothing processed yet: surface the error and leave the cursor alone.
-            Err(e) if pages_fetched == 0 => return Err(e),
-            // Earlier pages were already processed and the cursor advanced past
-            // them; stop here so their batched alerts and deliveries still finish.
-        let (function_names, amount_stroops) =
-            match fetch_soroban_details(client, poll_base, &tx_hash).await {
-                Ok(details) => details,
-                Err(e) => {
-                    warn!(
-                        contract = %contract.label, tx = %tx_hash, error = %e,
-                        "could not fetch operation details — evaluating rules without them"
-                    );
-                    (Vec::new(), None)
-                }
-            };
-
-        let ledger = record.tx.ledger;
-        let enriched = match EnrichedTransaction::from_horizon(
-            record.tx,
-            function_names,
-            amount_stroops,
-            None,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                error!(contract = %contract.label, error = %e,
-                    "failed to fetch a later page — continuing from the saved cursor next cycle");
+            Err(error) if pages_fetched == 0 => return Err(error),
+            Err(error) => {
+                warn!(
+                    contract = %contract.label,
+                    error = %error,
+                    "failed to fetch a later page; continuing from the saved cursor next cycle"
+                );
                 break;
             }
         };
+        let records = page.records;
+        let next_cursor = page.next_cursor;
         pages_fetched += 1;
 
         if records.is_empty() {
@@ -1323,7 +1159,6 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             break;
         }
         let page_len = records.len();
-        let last_token = records.last().map(|r| r.tx.paging_token.clone());
         info!(contract = %contract.label, count = page_len, "fetched new transactions");
 
         for record in records {
@@ -1336,19 +1171,22 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
 
             // Issue #23: if Horizon returned inline operations, use them directly.
             // Otherwise fall back to a separate /operations fetch.
-            let (function_names, amount_stroops) = if !record.operations.is_empty() {
+            let details = if !record.operations.is_empty() {
                 debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
                 extract_soroban_details(record.operations)
             } else {
-                match fetch_soroban_details(client, poll_base, &tx_hash).await {
-                    Ok(details) => details,
-                    Err(e) => {
-                        warn!(
-                            contract = %contract.label, tx = %tx_hash, error = %e,
-                            "could not fetch operation details — evaluating rules without them"
-                        );
-                        (Vec::new(), None)
-                    }
+                fetch_soroban_details(client, poll_base, &tx_hash).await
+            };
+            let (function_names, amount_stroops) = match details {
+                Ok(details) => details,
+                Err(error) => {
+                    warn!(
+                        contract = %contract.label,
+                        tx = %tx_hash,
+                        error = %error,
+                        "could not fetch operation details — evaluating rules without them"
+                    );
+                    (Vec::new(), None)
                 }
             };
 
@@ -1380,36 +1218,20 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
 
             tx_count += 1;
 
+            let enriched = if contract.needs_events() {
+                let events =
+                    transaction_events(client, contract, &tx_hash, ledger, &mut events_by_ledger)
+                        .await;
+                enriched.with_events(events)
+            } else {
+                enriched
+            };
             let payloads = evaluate(
                 &eval_ctx,
                 &contract.rules,
                 &enriched,
                 Some(&state.suppressor),
             );
-            let enriched = if contract.needs_events() {
-                let events = transaction_events(
-                    client,
-                    contract,
-                    &tx_hash,
-                    ledger,
-                    &mut events_by_ledger,
-                )
-                .await;
-                enriched.with_events(events)
-            } else {
-                enriched
-            };
-
-            tx_count += 1;
-        let enriched = if contract.needs_events() {
-            let events =
-                transaction_events(client, contract, &tx_hash, ledger, &mut events_by_ledger).await;
-            enriched.with_events(events)
-        } else {
-            enriched
-        };
-
-            let payloads = evaluate_contract(contract, canonical_base, &enriched);
 
             if payloads.is_empty() {
                 debug!(contract = %contract.label, tx = %tx_hash,
@@ -1419,26 +1241,21 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
 
             for payload in payloads {
                 alert_count += 1;
-                deliver_payload(
-                    client, contract, &payload, dry_run, &mut webhook_failures,
-                )
-                .await;
+                if contract.batch_alerts {
+                    batch.push(payload);
+                } else {
+                    deliver_payload(client, contract, &payload, dry_run, &mut webhook_failures)
+                        .await;
+                }
             }
         }
 
         if page_len < HORIZON_PAGE_LIMIT {
             break;
         }
-        match last_token {
-            Some(token) => page_cursor = token,
+        match next_cursor {
+            Some(next) => page_cursor = next,
             None => break,
-        for payload in payloads {
-            alert_count += 1;
-            if contract.batch_alerts {
-                batch.push(payload);
-            } else {
-                deliver_payload(client, contract, &payload, dry_run, &mut webhook_failures).await;
-            }
         }
     }
 
@@ -1519,53 +1336,6 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     }
 
     Ok((tx_count, alert_count, webhook_failures, skipped))
-}
-
-/// One page of a Horizon transactions request.
-enum PageFetch {
-    Records(Vec<HorizonTransactionWithOps>),
-    /// Horizon answered 429; wait the capped delay before polling again.
-    RateLimited {
-        requested_delay: Option<Duration>,
-        applied_delay: Duration,
-    },
-}
-
-/// Fetches and parses one page of transactions from `url`.
-async fn fetch_transactions_page(
-    client: &Client,
-    contract: &WatchedContract,
-    url: &str,
-) -> Result<PageFetch> {
-    #[cfg(feature = "metrics")]
-    let started = std::time::Instant::now();
-    let response = client.get(url).send().await;
-    #[cfg(feature = "metrics")]
-    metrics::observe_horizon_request(contract.network.as_str(), started.elapsed().as_secs_f64());
-    #[cfg(not(feature = "metrics"))]
-    let _ = contract;
-    let response = response.with_context(|| format!("GET {} failed", url))?;
-
-    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok());
-        let (requested_delay, applied_delay) = retry_after_delay(retry_after, Utc::now());
-        return Ok(PageFetch::RateLimited {
-            requested_delay,
-            applied_delay,
-        });
-    }
-
-    let status = response.status();
-    let page: HorizonPage = response
-        .error_for_status()
-        .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
-        .json()
-        .await
-        .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-    Ok(PageFetch::Records(page._embedded.records))
 }
 
 /// Deliver a single `AlertPayload` to the contract's webhook, counting any
@@ -1726,27 +1496,6 @@ fn evaluate_contract(
 
 // ── Soroban operation enrichment ──────────────────────────────────────────────
 
-/// Parses a Horizon decimal amount such as `"12.5000000"` into stroops
-/// (1 XLM = 10^7 stroops) exactly, without going through floating point.
-/// Returns `None` for anything that is not a non-negative decimal with at most
-/// seven fractional digits.
-fn parse_stroops(amount: &str) -> Option<u64> {
-    let amount = amount.trim();
-    let (whole, frac) = amount.split_once('.').unwrap_or((amount, ""));
-    if whole.is_empty() && frac.is_empty() {
-        return None;
-    }
-    if !whole.chars().all(|c| c.is_ascii_digit())
-        || !frac.chars().all(|c| c.is_ascii_digit())
-        || frac.len() > 7
-    {
-        return None;
-    }
-    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
-    let frac: u64 = format!("{:0<7}", frac).parse().ok()?;
-    whole.checked_mul(10_000_000)?.checked_add(frac)
-}
-
 fn is_native(asset_type: &Option<String>) -> bool {
     asset_type.as_deref() == Some("native")
 }
@@ -1761,16 +1510,20 @@ fn is_native(asset_type: &Option<String>) -> bool {
 ///   into another asset). A native-to-native path payment counts once;
 /// - `invoke_host_function`: every native `transfer` in `asset_balance_changes`
 ///   (Stellar Asset Contract transfers).
-fn native_stroops_moved(op: &HorizonOperation) -> Option<u64> {
+fn native_stroops_moved(op: &HorizonOperation) -> Result<Option<u64>> {
     match op.op_type.as_str() {
-        "create_account" => op.starting_balance.as_deref().and_then(parse_stroops),
+        "create_account" => op
+            .starting_balance
+            .as_deref()
+            .map(parse_stroops)
+            .transpose(),
         "path_payment_strict_send" | "path_payment_strict_receive" => {
             if is_native(&op.asset_type) {
-                op.amount.as_deref().and_then(parse_stroops)
+                op.amount.as_deref().map(parse_stroops).transpose()
             } else if is_native(&op.source_asset_type) {
-                op.source_amount.as_deref().and_then(parse_stroops)
+                op.source_amount.as_deref().map(parse_stroops).transpose()
             } else {
-                None
+                Ok(None)
             }
         }
         "invoke_host_function" => {
@@ -1779,23 +1532,19 @@ fn native_stroops_moved(op: &HorizonOperation) -> Option<u64> {
                 if change.change_type != "transfer" || !is_native(&change.asset_type) {
                     continue;
                 }
-                if let Some(stroops) = change.amount.as_deref().and_then(parse_stroops) {
+                if let Some(stroops) = change.amount.as_deref().map(parse_stroops).transpose()? {
                     total = Some(total.unwrap_or(0).saturating_add(stroops));
                 }
             }
-            total
+            Ok(total)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// Extract Soroban details from a slice of already-fetched operations.
 /// Used for both inline (join=operations) and separately-fetched operations.
 ///
-/// The returned amount is the total native XLM moved by the transaction, in
-/// stroops: `payment` operations plus the sources handled by
-/// [`native_stroops_moved`]. `None` when no operation moved native XLM.
-fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u64>) {
 /// Number of fractional digits in a Horizon XLM amount (1 XLM = 10^7 stroops).
 const STROOP_DECIMALS: usize = 7;
 
@@ -1818,7 +1567,9 @@ fn parse_stroops(amount: &str) -> Result<u64> {
         Some((i, f)) => (i, f),
         None => (amount, ""),
     };
-    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+    if (!int_part.is_empty() && !int_part.bytes().all(|b| b.is_ascii_digit()))
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
         anyhow::bail!("malformed amount {:?}: invalid integer part", amount);
     }
     if amount.contains('.') && frac_part.is_empty() {
@@ -1832,9 +1583,13 @@ fn parse_stroops(amount: &str) -> Result<u64> {
         );
     }
 
-    let whole: u64 = int_part
-        .parse()
-        .with_context(|| format!("malformed amount {:?}: integer part out of range", amount))?;
+    let whole: u64 = if int_part.is_empty() {
+        0
+    } else {
+        int_part
+            .parse()
+            .with_context(|| format!("malformed amount {:?}: integer part out of range", amount))?
+    };
     let padded = format!("{:0<width$}", frac_part, width = STROOP_DECIMALS);
     let frac: u64 = padded
         .parse()
@@ -1857,7 +1612,7 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> Result<(Vec<String>, O
     let mut has_amount = false;
 
     for op in ops {
-        if let Some(stroops) = native_stroops_moved(&op) {
+        if let Some(stroops) = native_stroops_moved(&op)? {
             total_stroops = total_stroops.saturating_add(stroops);
             has_amount = true;
         }
@@ -1875,31 +1630,18 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> Result<(Vec<String>, O
             }
         }
         if op.op_type == "payment" && op.asset_type.as_deref() == Some("native") {
-            if let Some(amt_str) = op.amount {
-                if let Ok(xlm) = amt_str.parse::<f64>() {
-                    total_stroops = total_stroops.saturating_add((xlm * 10_000_000.0) as u64);
-                    has_amount = true;
-                }
-                let stroops = parse_stroops(&amt_str).map_err(|e| {
+            if let Some(amt_str) = op.amount.as_deref() {
+                let stroops = parse_stroops(amt_str).map_err(|e| {
                     error!(error = %e, "invalid payment amount in Horizon operation");
                     e
                 })?;
                 total_stroops = total_stroops.saturating_add(stroops);
-                has_payment = true;
+                has_amount = true;
             }
         }
     }
 
-    Ok((
-        function_names,
-        if has_amount { Some(total_stroops) } else { None },
-    )
-        if has_payment {
-            Some(total_stroops)
-        } else {
-            None
-        },
-    ))
+    Ok((function_names, has_amount.then_some(total_stroops)))
 }
 
 /// Fetch all operations for a single transaction from Horizon.
@@ -1933,13 +1675,12 @@ async fn fetch_soroban_details(
             .await
             .with_context(|| format!("failed to parse operations from {}", url))?;
 
-        let count = page._embedded.records.len();
         ops.extend(page._embedded.records);
 
         let next = page._links.and_then(|l| l.next).map(|n| n.href);
         match next {
-            Some(next_url) if count >= OPERATIONS_PAGE_LIMIT => url = next_url,
-            _ => break,
+            Some(next_url) => url = next_url,
+            None => break,
         }
     }
 
@@ -2288,13 +2029,14 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts, _) = poll_contract(
+        let (txs, alerts, _, _) = poll_contract(
             &client,
             &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             false,
         )
         .await
@@ -2376,7 +2118,7 @@ mod tests {
         .expect("recorded fixture is valid JSON");
         let op: HorizonOperation =
             serde_json::from_value(recorded).expect("operation deserialises");
-        let (names, amount) = extract_soroban_details(vec![op]);
+        let (names, amount) = extract_soroban_details(vec![op]).unwrap();
         assert_eq!(names, vec!["push"]);
         assert!(amount.is_none());
     }
@@ -2393,8 +2135,9 @@ mod tests {
                 value: "AAAAEgAAAAEJIX5C6S3X6ftDOw+T3MtGCdZN6Xv2zEfpPmTF42f8og==".into(),
             }],
             amount: None,
+            ..Default::default()
         };
-        let (names, _) = extract_soroban_details(vec![op]);
+        let (names, _) = extract_soroban_details(vec![op]).unwrap();
         assert!(names.is_empty(), "no Sym means no contract function name");
     }
 
@@ -2424,11 +2167,9 @@ mod tests {
     fn payment_op(asset_type: &str, amount: &str) -> HorizonOperation {
         HorizonOperation {
             op_type: "payment".into(),
-            function: None,
             amount: Some(amount.into()),
             asset_type: Some(asset_type.into()),
-            asset_code: None,
-            asset_issuer: None,
+            ..Default::default()
         }
     }
 
@@ -2447,8 +2188,19 @@ mod tests {
     #[test]
     fn parse_stroops_rejects_malformed_amounts() {
         for bad in [
-            "", ".", ".5", "1.", "abc", "1.2.3", "-1", "+1", " 1", "1 ", "1e3",
-            "0.00000001", "1,5", "18446744073709.5516160",
+            "",
+            ".",
+            "1.",
+            "abc",
+            "1.2.3",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1e3",
+            "0.00000001",
+            "1,5",
+            "18446744073709.5516160",
         ] {
             assert!(parse_stroops(bad).is_err(), "{bad:?} should be rejected");
         }
@@ -2469,8 +2221,7 @@ mod tests {
         assert_eq!(amount, Some(15_000_000));
 
         let (_, amount) =
-            extract_soroban_details(vec![payment_op("credit_alphanum4", "50000.0000000")])
-                .unwrap();
+            extract_soroban_details(vec![payment_op("credit_alphanum4", "50000.0000000")]).unwrap();
         assert!(amount.is_none());
     }
 
@@ -2508,7 +2259,11 @@ mod tests {
         let records: Vec<serde_json::Value> = (1..=15)
             .map(|i| {
                 if i == 12 {
-                    serde_json::json!({ "type": "invoke_host_function", "function": "withdraw" })
+                    serde_json::json!({
+                        "type": "invoke_host_function",
+                        "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+                        "parameters": [{ "type": "Sym", "value": "AAAADwAAAAh3aXRoZHJhdw==" }]
+                    })
                 } else {
                     serde_json::json!({ "type": "bump_sequence" })
                 }
@@ -2546,7 +2301,11 @@ mod tests {
             .and(wiremock::matchers::query_param("cursor", "200"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "_embedded": { "records": [
-                    { "type": "invoke_host_function", "function": "withdraw" }
+                    {
+                        "type": "invoke_host_function",
+                        "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+                        "parameters": [{ "type": "Sym", "value": "AAAADwAAAAh3aXRoZHJhdw==" }]
+                    }
                 ] }
             })))
             .mount(&server)
@@ -2626,11 +2385,12 @@ mod tests {
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             false,
         )
         .await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
-        assert_eq!(result.unwrap(), (0, 0, 0));
+        assert_eq!(result.unwrap(), (0, 0, 0, 0));
     }
 
     #[tokio::test]
@@ -2672,6 +2432,7 @@ mod tests {
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             false,
         )
         .await
@@ -2779,6 +2540,7 @@ mod tests {
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             false,
         )
         .await;
@@ -2895,6 +2657,7 @@ mod tests {
             http_tcp_keepalive_secs: 30,
             http_connection_verbose: None,
             max_contracts: None,
+            max_pages_per_cycle: None,
         }
     }
 
@@ -2904,7 +2667,10 @@ mod tests {
     }
 
     fn all_now() -> HashMap<String, String> {
-        HashMap::from([(ID_A.into(), "now".into()), (ID_B.into(), "now".into())])
+        HashMap::from([
+            (format!("testnet:{ID_A}"), "now".into()),
+            (format!("testnet:{ID_B}"), "now".into()),
+        ])
     }
 
     #[test]
@@ -2920,7 +2686,10 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(
             cursors,
-            HashMap::from([(ID_A.into(), "111".into()), (ID_B.into(), "222".into())])
+            HashMap::from([
+                (format!("testnet:{ID_A}"), "111".into()),
+                (format!("testnet:{ID_B}"), "222".into()),
+            ])
         );
     }
 
@@ -2930,8 +2699,14 @@ mod tests {
         fs::write(&path, format!(r#"{{"{ID_A}": "111"}}"#)).unwrap();
         let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
         let _ = fs::remove_file(&path);
-        assert_eq!(cursors.get(ID_A).map(String::as_str), Some("111"));
-        assert_eq!(cursors.get(ID_B).map(String::as_str), Some("now"));
+        assert_eq!(
+            cursors.get(&format!("testnet:{ID_A}")).map(String::as_str),
+            Some("111")
+        );
+        assert_eq!(
+            cursors.get(&format!("testnet:{ID_B}")).map(String::as_str),
+            Some("now")
+        );
     }
 
     #[test]
@@ -3024,17 +2799,18 @@ mod tests {
             batch_alerts: false,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
-        cursors.insert(contract.contract_id.clone(), "now".to_string());
+        cursors.insert(contract.cursor_key(), "now".to_string());
 
         // Dry run: the assertions are about pagination and the counters, and
         // delivering 201 alerts to an unmocked endpoint would retry each one.
-        let (txs, alerts, failures) = poll_contract(
+        let (txs, alerts, failures, _) = poll_contract(
             &client,
             &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             true,
         )
         .await
@@ -3043,7 +2819,7 @@ mod tests {
         assert_eq!(alerts, 201);
         assert_eq!(failures, 0);
         assert_eq!(
-            cursors.get(&contract.contract_id).map(String::as_str),
+            cursors.get(&contract.cursor_key()).map(String::as_str),
             Some("201")
         );
     }
@@ -3229,13 +3005,14 @@ mod tests {
         let mut state = ContractPollState::default();
         let mut cooldowns = CooldownTracker::new();
 
-        let (_, alerts, failures) = poll_contract(
+        let (_, alerts, failures, _) = poll_contract(
             &client,
             &HorizonSource::new(&client, poll_base_url(&contract)),
             &contract,
             &mut cursors,
             &mut state,
             &mut cooldowns,
+            10,
             false,
         )
         .await
@@ -3332,13 +3109,14 @@ mod tests {
 
         let client = Client::new();
         let source = HorizonSource::new(&client, poll_base_url(&contract));
-        let (txs, alerts, failures) = poll_contract(
+        let (txs, alerts, failures, _) = poll_contract(
             &client,
             &source,
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             false,
         )
         .await
@@ -3356,13 +3134,14 @@ mod tests {
 
         let client = Client::new();
         let source = HorizonSource::new(&client, poll_base_url(&contract));
-        let (_, alerts, _) = poll_contract(
+        let (_, alerts, _, _) = poll_contract(
             &client,
             &source,
             &contract,
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             false,
         )
         .await
@@ -3385,6 +3164,7 @@ mod tests {
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             true,
         )
         .await
@@ -3403,6 +3183,7 @@ mod tests {
             &mut cursors,
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            10,
             false,
         )
         .await
@@ -3464,7 +3245,10 @@ mod tests {
         assert!(output.contains("contract polling task failed"), "{output}");
         assert!(output.contains("contract=Vault"), "{output}");
         assert!(output.contains("network=testnet"), "{output}");
-        assert!(output.contains(&format!("contract_id={}", contract.contract_id)), "{output}");
+        assert!(
+            output.contains(&format!("contract_id={}", contract.contract_id)),
+            "{output}"
+        );
         assert!(output.contains("consecutive_failures=3"), "{output}");
     }
 }
@@ -3481,28 +3265,29 @@ mod amount_and_cursor_tests {
 
     #[test]
     fn parse_stroops_is_exact() {
-        assert_eq!(parse_stroops("1"), Some(10_000_000));
-        assert_eq!(parse_stroops("1.5"), Some(15_000_000));
-        assert_eq!(parse_stroops("0.0000001"), Some(1));
-        assert_eq!(parse_stroops("1000.0000000"), Some(10_000_000_000));
-        assert_eq!(parse_stroops(".5"), Some(5_000_000));
+        assert_eq!(parse_stroops("1").unwrap(), 10_000_000);
+        assert_eq!(parse_stroops("1.5").unwrap(), 15_000_000);
+        assert_eq!(parse_stroops("0.0000001").unwrap(), 1);
+        assert_eq!(parse_stroops("1000.0000000").unwrap(), 10_000_000_000);
+        assert_eq!(parse_stroops(".5").unwrap(), 5_000_000);
         // f64 would turn this into 9_999_999.999… and truncate to 9_999_999.
-        assert_eq!(parse_stroops("0.9999999"), Some(9_999_999));
+        assert_eq!(parse_stroops("0.9999999").unwrap(), 9_999_999);
     }
 
     #[test]
     fn parse_stroops_rejects_bad_input() {
         for bad in ["", ".", "-1", "1.00000001", "abc", "1.2.3", "1e3"] {
-            assert_eq!(parse_stroops(bad), None, "{bad:?}");
+            assert!(parse_stroops(bad).is_err(), "{bad:?}");
         }
-        assert_eq!(parse_stroops("99999999999999999999"), None);
+        assert!(parse_stroops("99999999999999999999").is_err());
     }
 
     #[test]
     fn payment_operations_still_count() {
         let (_, amount) = extract_soroban_details(ops(serde_json::json!([
-            { "type": "payment", "amount": "1000.0000000" }
-        ])));
+            { "type": "payment", "asset_type": "native", "amount": "1000.0000000" }
+        ])))
+        .unwrap();
         assert_eq!(amount, Some(10_000_000_000));
     }
 
@@ -3510,7 +3295,8 @@ mod amount_and_cursor_tests {
     fn create_account_counts_starting_balance() {
         let (_, amount) = extract_soroban_details(ops(serde_json::json!([
             { "type": "create_account", "starting_balance": "2.5000000" }
-        ])));
+        ])))
+        .unwrap();
         assert_eq!(amount, Some(25_000_000));
     }
 
@@ -3521,7 +3307,8 @@ mod amount_and_cursor_tests {
             "type": "path_payment_strict_send",
             "asset_type": "native", "amount": "10.0000000",
             "source_asset_type": "credit_alphanum4", "source_amount": "99.0000000"
-        }])));
+        }])))
+        .unwrap();
         assert_eq!(to_native, Some(100_000_000));
 
         // Source sends XLM: count `source_amount`.
@@ -3529,7 +3316,8 @@ mod amount_and_cursor_tests {
             "type": "path_payment_strict_receive",
             "asset_type": "credit_alphanum4", "amount": "99.0000000",
             "source_asset_type": "native", "source_amount": "20.0000000"
-        }])));
+        }])))
+        .unwrap();
         assert_eq!(from_native, Some(200_000_000));
 
         // Native on both sides counts once.
@@ -3537,7 +3325,8 @@ mod amount_and_cursor_tests {
             "type": "path_payment_strict_send",
             "asset_type": "native", "amount": "5.0000000",
             "source_asset_type": "native", "source_amount": "5.1000000"
-        }])));
+        }])))
+        .unwrap();
         assert_eq!(both, Some(50_000_000));
     }
 
@@ -3547,7 +3336,8 @@ mod amount_and_cursor_tests {
             "type": "path_payment_strict_send",
             "asset_type": "credit_alphanum4", "amount": "10.0000000",
             "source_asset_type": "credit_alphanum4", "source_amount": "10.0000000"
-        }])));
+        }])))
+        .unwrap();
         assert_eq!(amount, None);
     }
 
@@ -3556,13 +3346,15 @@ mod amount_and_cursor_tests {
         let (functions, amount) = extract_soroban_details(ops(serde_json::json!([{
             "type": "invoke_host_function",
             "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+            "parameters": [{ "type": "Sym", "value": "AAAADwAAAAh3aXRoZHJhdw==" }],
             "asset_balance_changes": [
                 { "type": "transfer", "asset_type": "native", "amount": "3.0000000" },
                 { "type": "transfer", "asset_type": "native", "amount": "1.5000000" },
                 { "type": "transfer", "asset_type": "credit_alphanum4", "amount": "500.0000000" },
                 { "type": "mint", "asset_type": "native", "amount": "7.0000000" }
             ]
-        }])));
+        }])))
+        .unwrap();
         assert_eq!(functions.len(), 1);
         assert_eq!(amount, Some(45_000_000));
     }
@@ -3572,20 +3364,22 @@ mod amount_and_cursor_tests {
         let (_, amount) = extract_soroban_details(ops(serde_json::json!([
             { "type": "invoke_host_function", "function": "withdraw" },
             { "type": "invoke_host_function", "function": "x", "asset_balance_changes": null }
-        ])));
+        ])))
+        .unwrap();
         assert_eq!(amount, None);
     }
 
     #[test]
     fn amounts_from_every_operation_type_are_summed() {
         let (_, amount) = extract_soroban_details(ops(serde_json::json!([
-            { "type": "payment", "amount": "1.0000000" },
+            { "type": "payment", "asset_type": "native", "amount": "1.0000000" },
             { "type": "create_account", "starting_balance": "2.0000000" },
             { "type": "path_payment_strict_send", "asset_type": "native", "amount": "3.0000000" },
             { "type": "invoke_host_function", "asset_balance_changes": [
                 { "type": "transfer", "asset_type": "native", "amount": "4.0000000" }
             ] }
-        ])));
+        ])))
+        .unwrap();
         assert_eq!(amount, Some(100_000_000));
     }
 
@@ -3618,7 +3412,8 @@ mod amount_and_cursor_tests {
     #[test]
     fn legacy_entry_migrates_when_only_one_contract_has_that_id() {
         let key = format!("testnet:{ID}");
-        let migrated = migrate_saved_cursors(saved(&[(ID, "42")]), &configured(&[(key.as_str(), ID)]));
+        let migrated =
+            migrate_saved_cursors(saved(&[(ID, "42")]), &configured(&[(key.as_str(), ID)]));
         assert_eq!(migrated.get(&key).map(String::as_str), Some("42"));
         assert!(!migrated.contains_key(ID), "legacy key must be dropped");
     }
@@ -3650,10 +3445,8 @@ mod amount_and_cursor_tests {
     fn new_format_entries_for_unconfigured_contracts_are_preserved() {
         let other = "mainnet:CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let key = format!("testnet:{ID}");
-        let migrated = migrate_saved_cursors(
-            saved(&[(other, "9")]),
-            &configured(&[(key.as_str(), ID)]),
-        );
+        let migrated =
+            migrate_saved_cursors(saved(&[(other, "9")]), &configured(&[(key.as_str(), ID)]));
         assert_eq!(migrated.get(other).map(String::as_str), Some("9"));
     }
 }

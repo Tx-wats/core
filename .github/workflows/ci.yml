@@ -20,9 +20,9 @@ jobs:
       - name: Regenerate and compare config schema
         run: |
           cargo run --quiet -p txwatch -- schema > /tmp/txwatch-config.schema.json
-          jq -e '.properties.poll_interval_seconds and .properties.contracts and .definitions.WatchedContract and .definitions.AlertRule' /tmp/txwatch-config.schema.json
+          jq -e '.properties.poll_interval_seconds and .properties.contracts and ."$defs".WatchedContract and ."$defs".RuleConfig and ."$defs".RuleEntry' /tmp/txwatch-config.schema.json
           jq -e '.properties.poll_interval_seconds and .properties.contracts and .definitions.WatchedContract and .definitions.AlertRule' docs/txwatch-config.schema.json
-          test "$(jq -r '.properties.contracts.items."$ref"' /tmp/txwatch-config.schema.json)" = "#/definitions/WatchedContract"
+          test "$(jq -r '.properties.contracts.items."$ref"' /tmp/txwatch-config.schema.json)" = "#/$defs/WatchedContract"
 
   # ── Format ──────────────────────────────────────────────────────────────────
   fmt:
