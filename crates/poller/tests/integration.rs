@@ -1133,6 +1133,35 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
     );
 }
 
+/// Issue #4: Horizon's `/accounts/{id}` routes only accept G-addresses, so the
+/// only transaction source cannot serve a contract (C…) address. This pins the
+/// recorded rejection so the limitation is visible in the test suite, and
+/// documents the HTTP 400 the poller surfaces today.
+///
+/// It is a regression guard, not a fix: C-addresses still do not work until a
+/// Soroban RPC source lands.
+#[tokio::test]
+async fn horizon_rejects_a_contract_address_on_the_accounts_endpoint() {
+    let recorded: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/horizon_c_address_transactions_400.json"
+    ))
+    .expect("recorded Horizon error is valid JSON");
+    assert_eq!(recorded["status"], 400);
+    assert_eq!(recorded["extras"]["invalid_field"], "account_id");
+
+    // Replay the recorded body so the poller sees exactly what a live contract
+    // produces. The error text itself is asserted in
+    // `horizon_c_address_rejection_names_the_account_id_field` in src/lib.rs,
+    // which can reach the crate-internal `HorizonSource`.
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(recorded.clone()))
+        .mount(&horizon)
+        .await;
+
+    let mut contract =
+        helpers::contract("https://example.com/hook", vec![AlertRule::AnyTransaction]);
 /// Issue #5: the cursor file was read on startup but never written, so a
 /// restart replayed every transaction since the original cursor. This drives
 /// the real polling loop, then reads the file back and asserts the paging token
@@ -1225,6 +1254,19 @@ async fn transactions_request_includes_failed() {
         max_contracts: None,
     };
 
+    // A rejected contract fails its poll and is counted; it does not abort the
+    // cycle. So the operational symptom is a watch that never sees anything
+    // rather than a crash, which is what makes this worth pinning.
+    let report = txwatch_poller::run_once(cfg, true)
+        .await
+        .expect("one rejected contract must not abort the whole cycle");
+    assert_eq!(report.transactions, 0);
+    assert_eq!(report.alerts, 0);
+    assert_eq!(
+        report.poll_failures, 1,
+        "the rejected contract must be counted as a poll failure"
+    );
+    assert!(!report.is_success());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let run =
         tokio::spawn(
