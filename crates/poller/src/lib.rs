@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs;
@@ -983,6 +984,34 @@ impl<'a> HorizonSource<'a> {
     }
 }
 
+const DEFAULT_RETRY_AFTER_SECS: u64 = 5;
+const MAX_RETRY_AFTER_SECS: u64 = 5 * 60;
+
+fn retry_after_delay(value: Option<&str>, now: DateTime<Utc>) -> (Option<Duration>, Duration) {
+    let requested = value.and_then(|value| {
+        let value = value.trim();
+        value
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+            .or_else(|| {
+                DateTime::parse_from_rfc2822(value)
+                    .ok()
+                    .map(|date| {
+                        date.with_timezone(&Utc)
+                            .signed_duration_since(now)
+                            .to_std()
+                            .unwrap_or(Duration::ZERO)
+                    })
+            })
+    });
+    let applied = requested
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_RETRY_AFTER_SECS))
+        .min(Duration::from_secs(MAX_RETRY_AFTER_SECS));
+
+    (requested, applied)
+}
+
 impl TransactionSource for HorizonSource<'_> {
     async fn fetch_page(
         &self,
@@ -1012,11 +1041,16 @@ impl TransactionSource for HorizonSource<'_> {
             let retry_after = response
                 .headers()
                 .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                .and_then(|value| value.to_str().ok());
+            let (requested_delay, applied_delay) = retry_after_delay(retry_after, Utc::now());
+            warn!(
+                contract = %contract.label,
+                retry_after = ?retry_after,
+                requested_delay = ?requested_delay,
+                applied_delay_secs = applied_delay.as_secs(),
+                "Horizon returned 429 — backing off"
+            );
+            tokio::time::sleep(applied_delay).await;
             return Ok(Some(TransactionPage {
                 records: Vec::new(),
                 next_cursor: None,
@@ -2087,6 +2121,50 @@ mod tests {
     use txwatch_config::{AlertRule, Network, RuleConfig};
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn retry_after_seconds_are_used() {
+        let now = DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let (requested, applied) = retry_after_delay(Some("17"), now);
+
+        assert_eq!(requested, Some(Duration::from_secs(17)));
+        assert_eq!(applied, Duration::from_secs(17));
+    }
+
+    #[test]
+    fn retry_after_http_date_is_parsed() {
+        let now = DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let (requested, applied) = retry_after_delay(Some("Wed, 30 Sep 2026 12:02:00 GMT"), now);
+
+        assert_eq!(requested, Some(Duration::from_secs(120)));
+        assert_eq!(applied, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn invalid_retry_after_uses_default() {
+        let now = Utc::now();
+
+        let (requested, applied) = retry_after_delay(Some("not a date"), now);
+
+        assert_eq!(requested, None);
+        assert_eq!(applied, Duration::from_secs(DEFAULT_RETRY_AFTER_SECS));
+    }
+
+    #[test]
+    fn very_large_retry_after_is_capped() {
+        let now = Utc::now();
+
+        let (requested, applied) = retry_after_delay(Some("86400"), now);
+
+        assert_eq!(requested, Some(Duration::from_secs(86_400)));
+        assert_eq!(applied, Duration::from_secs(MAX_RETRY_AFTER_SECS));
+    }
 
     fn empty_page() -> serde_json::Value {
         serde_json::json!({ "_embedded": { "records": [] } })
