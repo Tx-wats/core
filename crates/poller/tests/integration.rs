@@ -880,10 +880,11 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
 
 /// Two contracts polled concurrently: total wall time must be less than
 /// the sum of each contract's individual response delay, proving that a
-/// slow Horizon response for contract A does not delay contract B. Closes #36.
+/// slow Horizon response for contract A does not delay contract B. Closes #7
+/// and protects the concurrency behaviour introduced for #36.
 #[tokio::test]
 async fn contracts_polled_concurrently() {
-    const DELAY_MS: u64 = 300;
+    const DELAY_MS: u64 = 1000;
 
     let horizon1 = MockServer::start().await;
     let horizon2 = MockServer::start().await;
@@ -964,13 +965,12 @@ async fn contracts_polled_concurrently() {
     let elapsed = start.elapsed();
     run.abort();
 
-    // Sequential polling would take ≥ 2 × DELAY_MS. Concurrent polling takes ≈ DELAY_MS.
-    // We allow generous headroom (1.8×) to avoid flakiness on slow CI.
+    // Sequential polling takes at least 2 × DELAY_MS, so this 1.5× bound fails it.
     assert!(
-        elapsed < Duration::from_millis(DELAY_MS * 18 / 10 + 300),
-        "contracts should be polled concurrently; elapsed {:?} ≥ {:.0}ms",
+        elapsed < Duration::from_millis(DELAY_MS * 3 / 2),
+        "contracts should be polled concurrently; elapsed {:?} ≥ {}ms",
         elapsed,
-        DELAY_MS as f64 * 1.8 + 300.0,
+        DELAY_MS * 3 / 2,
     );
 }
 
