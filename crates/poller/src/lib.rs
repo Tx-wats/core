@@ -47,6 +47,16 @@ pub use metrics::serve_metrics;
 struct HorizonOperation {
     #[serde(rename = "type")]
     op_type: String,
+    /// Present on `invoke_host_function` operations. This is the *host function
+    /// type* (e.g. `HostFunctionTypeHostFunctionTypeInvokeContract`), not the
+    /// invoked contract function; see `contract_function_name`.
+    #[serde(rename = "function")]
+    host_function_type: Option<String>,
+    /// XDR-encoded `ScVal` arguments, base64 in a `value` string. The `Sym` entry
+    /// is the invoked contract function name.
+    #[serde(default)]
+    parameters: Vec<HorizonParameter>,
+    /// Present on `payment` operations (string, e.g. "1000.0000000").
     /// Present on `invoke_host_function` operations.
     function: Option<String>,
     /// Present on `payment` operations (string, e.g. "1000.0000000"). On path
@@ -65,6 +75,71 @@ struct HorizonOperation {
     asset_balance_changes: Option<Vec<AssetBalanceChange>>,
 }
 
+/// One `{"type": ..., "value": ...}` entry of an operation's `parameters` array.
+#[derive(Debug, Deserialize)]
+struct HorizonParameter {
+    /// The `ScVal` type name, e.g. `Address`, `Sym`, `U64`, `Bytes`.
+    #[serde(rename = "type")]
+    scv_type: String,
+    /// Base64 of the XDR-encoded `ScVal`.
+    value: String,
+}
+
+/// Decode the `Sym` parameter of an `invoke_host_function` operation, which holds
+/// the invoked contract function name.
+///
+/// The value is a base64 XDR-encoded `ScVal`. Only the `Symbol` variant is
+/// decoded: its XDR is a 4-byte big-endian discriminant, a 4-byte big-endian
+/// byte length, then the UTF-8 bytes. Everything else returns `None` — the
+/// remaining `ScVal` variants are not needed to identify the function and each
+/// needs its own decoder.
+fn contract_function_name(parameters: &[HorizonParameter]) -> Option<String> {
+    let sym = parameters.iter().find(|p| p.scv_type == "Sym")?;
+    let raw = base64_decode(&sym.value)?;
+    if raw.len() < 8 {
+        return None;
+    }
+    // 15 == SCV_SYMBOL
+    if u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) != 15 {
+        return None;
+    }
+    let len = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+    let end = 8usize.checked_add(len)?;
+    let bytes = raw.get(8..end)?;
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+/// Minimal standard-alphabet base64 decoder, so the poller does not need a
+/// new dependency for the one `ScVal` it decodes. Padding is optional.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn value(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((b - b'0') as u32 + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for b in input.bytes() {
+        if b == b'=' || b == b'\n' || b == b'\r' {
+            continue;
+        }
+        acc = (acc << 6) | value(b)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// A Horizon transaction record that may include inline operations via `join=operations`.
 /// One entry of `asset_balance_changes` on an `invoke_host_function` operation.
 #[derive(Deserialize)]
 struct AssetBalanceChange {
@@ -1482,8 +1557,16 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> Result<(Vec<String>, O
             has_amount = true;
         }
         if op.op_type == "invoke_host_function" {
-            if let Some(f) = op.function {
-                function_names.push(f);
+            // Issue #3: `op.function` is the host function type, so matching
+            // against it could never work. The contract function name is the
+            // `Sym` argument.
+            if let Some(name) = contract_function_name(&op.parameters) {
+                function_names.push(name);
+            } else {
+                debug!(
+                    host_function_type = ?op.host_function_type,
+                    "invoke_host_function operation carried no Sym parameter;                      contract function name unavailable"
+                );
             }
         }
         if op.op_type == "payment" && op.asset_type.as_deref() == Some("native") {
@@ -1719,16 +1802,62 @@ mod tests {
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn ops_page(function_name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "_embedded": {
-                "records": [{ "type": "invoke_host_function", "function": function_name }]
-            }
-        })
-    }
-
     fn empty_page() -> serde_json::Value {
         serde_json::json!({ "_embedded": { "records": [] } })
+    }
+
+    /// Base64-encode `bytes` (standard alphabet, with padding).
+    fn b64(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(A[(n >> 18) as usize & 63] as char);
+            out.push(A[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// The XDR-encoded `ScVal` base64 value of a `Sym`: a 4-byte big-endian
+    /// discriminant (15 == SCV_SYMBOL), a 4-byte big-endian length, then the
+    /// UTF-8 bytes padded to a 4-byte boundary.
+    fn sym_param(name: &str) -> String {
+        let mut raw = vec![0, 0, 0, 15];
+        raw.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        raw.extend_from_slice(name.as_bytes());
+        while raw.len() % 4 != 0 {
+            raw.push(0);
+        }
+        b64(&raw)
+    }
+
+    /// A realistic `invoke_host_function` operation, where `function` is the
+    /// host function type and the contract function name is the `Sym`
+    /// parameter. See issue #3.
+    fn invoke_op(function_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type":     "invoke_host_function",
+            "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+            "parameters": [
+                { "type": "Address", "value": "AAAAEgAAAAEJIX5C6S3X6ftDOw+T3MtGCdZN6Xv2zEfpPmTF42f8og==" },
+                { "type": "Sym",     "value": sym_param(function_name) }
+            ]
+        })
     }
 
     fn rule(r: AlertRule) -> RuleConfig {
@@ -1756,7 +1885,7 @@ mod tests {
                     "envelope_xdr": null,
                     "result_xdr":   null,
                     "operations": [
-                        { "type": "invoke_host_function", "function": "withdraw" }
+                        invoke_op("withdraw")
                     ]
                 }]
             }
@@ -1853,12 +1982,27 @@ mod tests {
         assert!(page._embedded.records.is_empty());
     }
 
+    /// Issue #3: driven by a recorded real testnet `invoke_host_function`
+    /// response, where `function` is the host function type and the contract
+    /// function name is the `Sym` parameter.
     #[tokio::test]
-    async fn fetch_soroban_details_extracts_function_name() {
+    async fn fetch_soroban_details_extracts_contract_function_name() {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/real_invoke_host_function.json"
+        ))
+        .expect("recorded fixture is valid JSON");
+        assert_eq!(
+            recorded["function"], "HostFunctionTypeHostFunctionTypeInvokeContract",
+            "fixture must be a real response, where `function` is not the name"
+        );
+
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex("/transactions/.*/operations"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ops_page("withdraw")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "_embedded": { "records": [recorded] } })),
+            )
             .mount(&server)
             .await;
 
@@ -1867,8 +2011,41 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(fn_names, vec!["withdraw"]);
+        assert_eq!(fn_names, vec!["push"], "the Sym parameter holds the name");
         assert!(amount.is_none());
+    }
+
+    /// The inline (`join=operations`) path must agree with the separate
+    /// `/operations` fetch: `extract_soroban_details` is shared, so this covers
+    /// the case where Horizon already returned the operation inline.
+    #[test]
+    fn extract_soroban_details_prefers_the_sym_parameter() {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/real_invoke_host_function.json"
+        ))
+        .expect("recorded fixture is valid JSON");
+        let op: HorizonOperation =
+            serde_json::from_value(recorded).expect("operation deserialises");
+        let (names, amount) = extract_soroban_details(vec![op]);
+        assert_eq!(names, vec!["push"]);
+        assert!(amount.is_none());
+    }
+
+    /// An `invoke_host_function` with no `Sym` argument yields no name rather
+    /// than the host function type.
+    #[test]
+    fn extract_soroban_details_ignores_operations_without_a_sym() {
+        let op = HorizonOperation {
+            op_type: "invoke_host_function".into(),
+            host_function_type: Some("HostFunctionTypeHostFunctionTypeInvokeContract".into()),
+            parameters: vec![HorizonParameter {
+                scv_type: "Address".into(),
+                value: "AAAAEgAAAAEJIX5C6S3X6ftDOw+T3MtGCdZN6Xv2zEfpPmTF42f8og==".into(),
+            }],
+            amount: None,
+        };
+        let (names, _) = extract_soroban_details(vec![op]);
+        assert!(names.is_empty(), "no Sym means no contract function name");
     }
 
     #[tokio::test]
@@ -2577,7 +2754,7 @@ mod tests {
                 "created_at": "2024-06-01T10:00:00Z",
                 "successful": true,
                 "paging_token": "1",
-                "operations": [{ "type": "invoke_host_function", "function": "withdraw" }]
+                "operations": [invoke_op("withdraw")]
             }] }
         });
         Mock::given(method("GET"))
@@ -2683,7 +2860,7 @@ mod tests {
                     "created_at": "2020-01-01T00:00:00Z",
                     "successful": true,
                     "paging_token": i.to_string(),
-                    "operations": [{ "type": "invoke_host_function", "function": "withdraw" }],
+                    "operations": [invoke_op("withdraw")],
                 })
             })
             .collect();

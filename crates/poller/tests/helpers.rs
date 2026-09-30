@@ -47,15 +47,64 @@ pub fn tx_page(hash: &str, paging_token: &str, successful: bool) -> serde_json::
     })
 }
 
-pub fn ops_page(function_name: &str) -> serde_json::Value {
+/// Base64-encode `bytes` (standard alphabet, with padding).
+pub fn b64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            A[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// The XDR-encoded `ScVal` base64 value of a `Sym`, as Horizon returns it:
+/// a 4-byte big-endian discriminant (15 == SCV_SYMBOL), a 4-byte big-endian
+/// length, then the UTF-8 bytes padded to a 4-byte boundary.
+pub fn sym_param(name: &str) -> String {
+    let mut raw = vec![0, 0, 0, 15];
+    raw.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    raw.extend_from_slice(name.as_bytes());
+    while raw.len() % 4 != 0 {
+        raw.push(0);
+    }
+    b64(&raw)
+}
+
+/// A realistic `invoke_host_function` operation.
+///
+/// `function` is the *host function type*, not the contract function name —
+/// that is what Horizon actually returns, and matching against it is the bug
+/// fixed in issue #3. The name is the `Sym` parameter.
+pub fn invoke_op(function_name: &str) -> serde_json::Value {
     serde_json::json!({
-        "_embedded": {
-            "records": [{
-                "type":     "invoke_host_function",
-                "function": function_name
-            }]
-        }
+        "type":     "invoke_host_function",
+        "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+        "parameters": [
+            { "type": "Address", "value": "AAAAEgAAAAEJIX5C6S3X6ftDOw+T3MtGCdZN6Xv2zEfpPmTF42f8og==" },
+            { "type": "Sym",     "value": sym_param(function_name) }
+        ]
     })
+}
+
+pub fn ops_page(function_name: &str) -> serde_json::Value {
+    serde_json::json!({ "_embedded": { "records": [invoke_op(function_name)] } })
 }
 
 pub fn payment_ops_page(amount_str: &str) -> serde_json::Value {
