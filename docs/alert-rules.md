@@ -46,6 +46,10 @@ Matches transactions where `successful = false`.
 
 **Use case:** detect reverted Soroban invocations or fee-bump failures.
 
+The poller requests transactions with `include_failed=true`, so failed
+transactions are fetched. Horizon omits them by default, which would leave this
+rule unable to match anything.
+
 ```toml
 [[contracts.rules]]
 type = "TransactionFailed"
@@ -60,8 +64,26 @@ type = "TransactionFailed"
 Matches when the payment amount (extracted from Horizon operations) is ≥ `threshold_xlm` XLM.
 The `amount_xlm` field in the webhook payload contains the actual transferred amount.
 
-**Note:** Amount is extracted from `payment` operation records. Soroban token transfers
-that do not produce a native `payment` operation will not populate `amount_xlm`.
+**Note:** The amount is the total native XLM moved by the transaction, summed across:
+
+- `payment` operations;
+- `create_account` operations (`starting_balance`);
+- `path_payment_strict_send` / `path_payment_strict_receive` operations, for the native leg
+  (`amount` when the destination asset is XLM, otherwise `source_amount` when the source asset
+  is XLM);
+- native `transfer` entries in `asset_balance_changes` on `invoke_host_function` operations
+  (Stellar Asset Contract transfers of XLM).
+
+Transfers of non-native assets are not counted, and a transaction that moves no native XLM does
+not populate `amount_xlm`.
+
+**Native-only:** Only payments whose `asset_type` is `native` (XLM) are counted. Payments in
+issued assets (`credit_alphanum4` / `credit_alphanum12`, e.g. USDC) are ignored, so a large
+non-native payment never fires `LargeTransfer` and never sets `amount_xlm`.
+
+**Precision:** Amounts are parsed as fixed-point stroops (up to 7 fractional digits), not as
+floating point. A native payment with a malformed amount is logged as an error and its
+operation details are not used for rule evaluation.
 
 ```toml
 [[contracts.rules]]

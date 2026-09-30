@@ -200,6 +200,18 @@ impl Network {
         }
     }
 
+    /// Identity of this network for keying per-network state such as poll
+    /// cursors. Named networks use their name; custom networks are told apart
+    /// by their Horizon URL, so two different private networks never collide.
+    pub fn cursor_id(&self) -> String {
+        match self {
+            Network::Custom(custom) => {
+                format!("custom@{}", custom.horizon_url.trim_end_matches('/'))
+            }
+            named => named.as_str().to_owned(),
+        }
+    }
+
     /// Human-readable display name shown in logs and CLI output.
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -1249,6 +1261,11 @@ pub fn validate_contract_id(id: &str) -> std::result::Result<[u8; 32], ContractI
 }
 
 impl WatchedContract {
+    /// This contract's poll-cursor key (see [`cursor_key`]).
+    pub fn cursor_key(&self) -> String {
+        cursor_key(&self.network, &self.contract_id)
+    }
+
     /// Every webhook destination: the `webhook_*` shorthand (when `webhook_url`
     /// is set) followed by the `[[contracts.webhooks]]` entries.
     pub fn destinations(&self) -> Vec<WebhookDestination> {
@@ -1449,6 +1466,23 @@ pub const MAX_CONTRACTS: usize = 100;
 /// own Horizon instance.
 pub const MAX_CONTRACTS_CEILING: usize = 10_000;
 
+/// Default for `max_pages_per_cycle`: the most Horizon pages (200 transactions
+/// each) one poll cycle fetches per contract before yielding. The rest is
+/// picked up from the saved cursor on the next cycle.
+pub const DEFAULT_MAX_PAGES_PER_CYCLE: usize = 10;
+
+/// Upper bound for the `max_pages_per_cycle` override.
+pub const MAX_PAGES_PER_CYCLE_CEILING: usize = 1_000;
+
+/// Key under which a contract's poll cursor is stored, in memory and in
+/// `cursor_file`: `<network>:<contract_id>`. Keying by network as well as
+/// contract ID keeps a contract deployed at the same address on several
+/// networks from sharing one cursor. Keys written before this format existed
+/// are the bare contract ID and contain no `:`.
+pub fn cursor_key(network: &Network, contract_id: &str) -> String {
+    format!("{}:{}", network.cursor_id(), contract_id)
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -1483,6 +1517,11 @@ pub struct AppConfig {
     /// the extra polling load.
     #[serde(default)]
     pub max_contracts: Option<usize>,
+    /// Maximum Horizon pages (200 transactions each) fetched per contract in one
+    /// poll cycle (1–1000). When the cap is hit the poller logs a warning and
+    /// continues from the saved cursor on the next cycle. Default: 10.
+    #[serde(default)]
+    pub max_pages_per_cycle: Option<usize>,
 }
 
 fn default_poll_interval_seconds() -> u64 {
@@ -1667,6 +1706,13 @@ impl AppConfig {
         self.max_contracts.unwrap_or(MAX_CONTRACTS)
     }
 
+    /// The per-cycle page cap in force: `max_pages_per_cycle`, else
+    /// [`DEFAULT_MAX_PAGES_PER_CYCLE`].
+    pub fn effective_max_pages_per_cycle(&self) -> usize {
+        self.max_pages_per_cycle
+            .unwrap_or(DEFAULT_MAX_PAGES_PER_CYCLE)
+    }
+
     /// Validates the whole config and reports every error found, not just the first.
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
@@ -1690,6 +1736,15 @@ impl AppConfig {
                 "http_tcp_keepalive_secs must be <= {} (0 disables keepalive)",
                 MAX_HTTP_TCP_KEEPALIVE_SECS
             ));
+        }
+
+        if let Some(pages) = self.max_pages_per_cycle {
+            if pages == 0 || pages > MAX_PAGES_PER_CYCLE_CEILING {
+                errors.push(format!(
+                    "max_pages_per_cycle must be between 1 and {}",
+                    MAX_PAGES_PER_CYCLE_CEILING
+                ));
+            }
         }
 
         if self.contracts.is_empty() {
@@ -1720,6 +1775,14 @@ impl AppConfig {
                 }
             }
         }
+
+        // Labels are already trimmed by `WatchedContract::collect_errors`; compare
+        // case-insensitively so "Vault" and "vault" count as duplicates.
+        let mut seen_labels = std::collections::HashSet::new();
+        let mut reported_labels = std::collections::HashSet::new();
+        for contract in &self.contracts {
+            let key = contract.label.to_lowercase();
+            if !seen_labels.insert(key.clone()) && reported_labels.insert(key) {
         // Labels are already trimmed by `WatchedContract::collect_errors`; compare
         // case-insensitively so "Vault" and "vault" count as duplicates. Report each
         // offending label once even when it appears more than twice.
@@ -1729,6 +1792,26 @@ impl AppConfig {
             let key = contract.label.to_lowercase();
             if !seen.insert(key) && reported.insert(contract.label.clone()) {
                 errors.push(format!("duplicate contract label '{}'", contract.label));
+            }
+        }
+
+        // Cursors are keyed by (network, contract_id), so the same contract may
+        // be watched on several networks but only once per network.
+        let mut seen_keys: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for contract in &self.contracts {
+            let key = contract.cursor_key();
+            if let Some(first_label) = seen_keys.get(&key).cloned() {
+                errors.push(format!(
+                    "duplicate contract_id '{}' on network '{}' (labels '{}' and '{}'); each \
+                     (network, contract_id) pair can be watched only once",
+                    contract.contract_id,
+                    contract.network.as_str(),
+                    first_label,
+                    contract.label
+                ));
+            } else {
+                seen_keys.insert(key, contract.label.clone());
             }
         }
 
@@ -2084,6 +2167,7 @@ mod tests {
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             max_contracts: None,
+            max_pages_per_cycle: None,
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -2118,6 +2202,7 @@ mod tests {
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             max_contracts: None,
+            max_pages_per_cycle: None,
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -2133,6 +2218,7 @@ mod tests {
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             max_contracts: None,
+            max_pages_per_cycle: None,
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -2224,6 +2310,7 @@ mod tests {
                 http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
                 http_connection_verbose: None,
                 max_contracts: None,
+                max_pages_per_cycle: None,
                 cursor_file: None,
             };
             let err = cfg.validate().unwrap_err();
@@ -2261,6 +2348,7 @@ mod tests {
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             max_contracts: None,
+            max_pages_per_cycle: None,
             cursor_file: None,
         }
     }
@@ -2274,6 +2362,111 @@ mod tests {
         [[contracts.rules]]
         type = "AnyTransaction"
     "#;
+
+    // ── cursor keys and duplicate (network, contract_id) entries ─────────────
+
+    fn two_contracts_toml(network_a: &str, network_b: &str) -> String {
+        format!(
+            r#"
+            [[contracts]]
+            label = "first"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+            network = "{network_a}"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+            [[contracts]]
+            label = "second"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+            network = "{network_b}"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#
+        )
+    }
+
+    #[test]
+    fn rejects_same_contract_id_twice_on_one_network() {
+        let mut cfg: AppConfig = toml::from_str(&two_contracts_toml("testnet", "testnet")).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate contract_id")
+                && err.contains("'testnet'")
+                && err.contains("'first' and 'second'"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn allows_same_contract_id_on_different_networks() {
+        let mut cfg: AppConfig =
+            toml::from_str(&two_contracts_toml("testnet", "mainnet")).unwrap();
+        cfg.validate().unwrap();
+        assert_ne!(cfg.contracts[0].cursor_key(), cfg.contracts[1].cursor_key());
+    }
+
+    #[test]
+    fn cursor_key_is_network_then_contract_id() {
+        let mut cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.contracts[0].cursor_key(),
+            "testnet:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+        );
+    }
+
+    #[test]
+    fn custom_networks_are_told_apart_by_horizon_url() {
+        let a = Network::Custom(CustomNetwork {
+            horizon_url: "http://localhost:8000/".to_owned(),
+            explorer_url: None,
+            passphrase: None,
+            rpc_url: None,
+        });
+        let same_as_a = Network::Custom(CustomNetwork {
+            horizon_url: "http://localhost:8000".to_owned(),
+            explorer_url: None,
+            passphrase: None,
+            rpc_url: None,
+        });
+        let b = Network::Custom(CustomNetwork {
+            horizon_url: "http://localhost:9000".to_owned(),
+            explorer_url: None,
+            passphrase: None,
+            rpc_url: None,
+        });
+        assert_eq!(a.cursor_id(), same_as_a.cursor_id());
+        assert_ne!(a.cursor_id(), b.cursor_id());
+        assert_ne!(cursor_key(&a, "CX"), cursor_key(&Network::Testnet, "CX"));
+    }
+
+    // ── max_pages_per_cycle ───────────────────────────────────────────────────
+
+    #[test]
+    fn max_pages_per_cycle_defaults_to_ten() {
+        let mut cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.max_pages_per_cycle, None);
+        assert_eq!(cfg.effective_max_pages_per_cycle(), 10);
+    }
+
+    #[test]
+    fn max_pages_per_cycle_can_be_overridden_within_bounds() {
+        let mut cfg: AppConfig =
+            toml::from_str(&format!("max_pages_per_cycle = 3\n{}", MINIMAL_TOML)).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.effective_max_pages_per_cycle(), 3);
+
+        for bad in [0, MAX_PAGES_PER_CYCLE_CEILING + 1] {
+            let mut cfg: AppConfig =
+                toml::from_str(&format!("max_pages_per_cycle = {}\n{}", bad, MINIMAL_TOML))
+                    .unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("max_pages_per_cycle must be between 1 and"), "got: {}", err);
+        }
+    }
 
     // ── #97: poll interval default and per-contract override ─────────────────
 

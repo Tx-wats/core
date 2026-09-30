@@ -3,6 +3,7 @@
 //! Exposes, labelled by `contract` (label) and `network` where noted:
 //! - `txwatch_transactions_total{contract,network}`      — transactions processed
 //! - `txwatch_alerts_total{contract,network}`            — alert payloads sent (rules matched)
+//! - `txwatch_transactions_skipped_total{contract,network}` — transactions dropped because they could not be enriched
 //! - `txwatch_webhook_failures_total{contract,network}`  — permanent webhook delivery failures
 //! - `txwatch_horizon_request_duration_seconds{network}` — Horizon request latency
 //! - `txwatch_webhook_delivery_duration_seconds`         — webhook delivery latency (incl. retries)
@@ -55,6 +56,18 @@ fn transactions_total() -> &'static IntCounterVec {
             CONTRACT_LABELS
         )
         .expect("register txwatch_transactions_total")
+    })
+}
+
+fn transactions_skipped_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_transactions_skipped_total",
+            "Total transactions skipped because they could not be enriched (e.g. an unparseable created_at), per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_transactions_skipped_total")
     })
 }
 
@@ -153,6 +166,14 @@ pub fn register_build_info() {
 /// Increment `txwatch_transactions_total` for a contract by `n`.
 pub fn inc_transactions(contract: &str, network: &str, n: u64) {
     transactions_total()
+        .with_label_values(&[contract, network])
+        .inc_by(n);
+}
+
+/// Increment `txwatch_transactions_skipped_total` for a contract by `n`.
+/// Calling it with `0` creates the series so it is exported before any skip.
+pub fn inc_transactions_skipped(contract: &str, network: &str, n: u64) {
+    transactions_skipped_total()
         .with_label_values(&[contract, network])
         .inc_by(n);
 }
