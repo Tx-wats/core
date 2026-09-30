@@ -1189,11 +1189,16 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             let retry_after = response
                 .headers()
                 .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                .and_then(|v| v.to_str().ok());
+            let (requested_delay, applied_delay) = retry_after_delay(retry_after, Utc::now());
+            warn!(
+                contract = %contract.label,
+                retry_after = ?retry_after,
+                requested_delay = ?requested_delay,
+                applied_delay_secs = applied_delay.as_secs(),
+                "Horizon returned 429 — backing off"
+            );
+            tokio::time::sleep(applied_delay).await;
             return Ok((0, 0, 0));
         }
 
@@ -1266,9 +1271,17 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
         );
         let records = match fetch_transactions_page(client, contract, &url).await {
             Ok(PageFetch::Records(records)) => records,
-            Ok(PageFetch::RateLimited { retry_after }) => {
-                warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            Ok(PageFetch::RateLimited {
+                requested_delay,
+                applied_delay,
+            }) => {
+                warn!(
+                    contract = %contract.label,
+                    requested_delay = ?requested_delay,
+                    applied_delay_secs = applied_delay.as_secs(),
+                    "Horizon returned 429 — backing off"
+                );
+                tokio::time::sleep(applied_delay).await;
                 break;
             }
             // Nothing processed yet: surface the error and leave the cursor alone.
@@ -1511,8 +1524,11 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
 /// One page of a Horizon transactions request.
 enum PageFetch {
     Records(Vec<HorizonTransactionWithOps>),
-    /// Horizon answered 429; wait `retry_after` seconds before polling again.
-    RateLimited { retry_after: u64 },
+    /// Horizon answered 429; wait the capped delay before polling again.
+    RateLimited {
+        requested_delay: Option<Duration>,
+        applied_delay: Duration,
+    },
 }
 
 /// Fetches and parses one page of transactions from `url`.
@@ -1534,10 +1550,12 @@ async fn fetch_transactions_page(
         let retry_after = response
             .headers()
             .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
-        return Ok(PageFetch::RateLimited { retry_after });
+            .and_then(|v| v.to_str().ok());
+        let (requested_delay, applied_delay) = retry_after_delay(retry_after, Utc::now());
+        return Ok(PageFetch::RateLimited {
+            requested_delay,
+            applied_delay,
+        });
     }
 
     let status = response.status();
