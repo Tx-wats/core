@@ -1164,9 +1164,19 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
         }
 
         let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "contract not found on {} (404): {}",
+                contract.network.as_str(),
+                truncate_response_body(&body)
+            ));
+        }
+        if !status.is_success() {
+            return Err(horizon_response_error(response, &url).await);
+        }
+
         let page: HorizonPage = response
-            .error_for_status()
-            .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
@@ -1850,6 +1860,27 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> Result<(Vec<String>, O
     ))
 }
 
+fn truncate_response_body(body: &str) -> String {
+    body.chars().take(200).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn horizon_error_body_is_truncated() {
+    assert_eq!(truncate_response_body(&"x".repeat(201)).len(), 200);
+}
+
+async fn horizon_response_error(response: reqwest::Response, url: &str) -> anyhow::Error {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    anyhow!(
+        "Horizon returned HTTP {} for {}: {}",
+        status,
+        url,
+        truncate_response_body(&body)
+    )
+}
+
 /// Fetch all operations for a single transaction from Horizon.
 /// Requests the maximum page size and follows `_links.next` while pages are full.
 #[tracing::instrument(skip(client), fields(tx = %tx_hash))]
@@ -1874,9 +1905,11 @@ async fn fetch_soroban_details(
             .await
             .with_context(|| format!("GET {} failed", url))?;
         let status = response.status();
+        if !status.is_success() {
+            return Err(horizon_response_error(response, &url).await);
+        }
+
         let page: OperationsPage = response
-            .error_for_status()
-            .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
             .json()
             .await
             .with_context(|| format!("failed to parse operations from {}", url))?;
@@ -2491,6 +2524,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_soroban_details_reports_http_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_string("operations unavailable"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = fetch_soroban_details(&Client::new(), &server.uri(), "abc123")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("503"));
+        assert!(error.contains("operations unavailable"));
+        assert!(!error.contains("failed to parse operations"));
+    }
+
+    #[tokio::test]
     async fn horizon_429_returns_meaningful_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2542,7 +2596,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex("/accounts/.*/transactions"))
-            .respond_with(ResponseTemplate::new(503))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_string("Horizon temporarily unavailable"),
+            )
             .mount(&server)
             .await;
 
@@ -2585,6 +2641,50 @@ mod tests {
             "error must contain HTTP status 503, got: {}",
             err
         );
+        assert!(err.to_string().contains("Horizon temporarily unavailable"));
+        assert!(!err.to_string().contains("failed to parse Horizon response"));
+    }
+
+    #[tokio::test]
+    async fn horizon_404_reports_contract_not_found_on_network() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+        let contract = WatchedContract {
+            label: "test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            rules: vec![rule(txwatch_config::AlertRule::AnyTransaction)],
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            enabled: true,
+            soroban_rpc_url: None,
+            horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+        };
+        let error = poll_contract(
+            &Client::new(),
+            &contract,
+            &mut HashMap::from([(contract.cursor_key(), "now".into())]),
+            &mut ContractPollState::default(),
+            &mut CooldownTracker::new(),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("contract not found on testnet"), "{error}");
     }
 
     /// Issue #4: Horizon's `/accounts/{id}` routes only accept G-addresses, so a
