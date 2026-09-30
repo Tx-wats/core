@@ -974,6 +974,131 @@ async fn contracts_polled_concurrently() {
     );
 }
 
+/// A slow Horizon request for one contract must not delay another contract's
+/// webhook.
+/// Closes #6.
+#[tokio::test]
+async fn slow_contract_does_not_block_fast_contract() {
+    const SLOW_DELAY_MS: u64 = 2500;
+    const FAST_DEADLINE_MS: u64 = 1000;
+
+    let slow_horizon = MockServer::start().await;
+    let fast_horizon = MockServer::start().await;
+    let slow_receiver = MockServer::start().await;
+    let fast_receiver = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(helpers::tx_page("slow_tx", "1", true))
+                .set_delay(Duration::from_millis(SLOW_DELAY_MS)),
+        )
+        .up_to_n_times(1)
+        .mount(&slow_horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&slow_horizon)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(helpers::tx_page("fast_tx", "1", true)),
+        )
+        .up_to_n_times(1)
+        .mount(&fast_horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&fast_horizon)
+        .await;
+
+    for horizon in [&slow_horizon, &fast_horizon] {
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&slow_receiver)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&fast_receiver)
+        .await;
+
+    let make_contract =
+        |label: &str, contract_id: &str, horizon: &MockServer, receiver: &MockServer| {
+        let mut contract = helpers::contract(
+            &format!("{}/hook", receiver.uri()),
+            vec![AlertRule::AnyTransaction],
+        );
+        contract.label = label.to_string();
+        contract.contract_id = contract_id.to_string();
+        contract.horizon_base_url_override = Some(horizon.uri());
+        contract
+    };
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 30,
+        contracts: vec![
+            make_contract(
+                "slow",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+                &slow_horizon,
+                &slow_receiver,
+            ),
+            make_contract(
+                "fast",
+                "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526",
+                &fast_horizon,
+                &fast_receiver,
+            ),
+        ],
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+        cursor_file: None,
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(txwatch_poller::run_with_shutdown(cfg, false, shutdown_rx));
+    let fast_delivered = tokio::time::timeout(
+        Duration::from_millis(FAST_DEADLINE_MS),
+        async {
+            loop {
+                if !fast_receiver.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .is_ok();
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(4), handle).await;
+
+    assert!(
+        fast_delivered,
+        "fast contract webhook should arrive before the slow Horizon request completes"
+    );
+}
+
 /// Reloading the config keeps the cursor of a contract that still exists and
 /// starts a newly added contract from `now`. Closes #98.
 #[tokio::test]
