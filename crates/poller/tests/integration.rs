@@ -1287,6 +1287,27 @@ async fn horizon_rejects_a_contract_address_on_the_accounts_endpoint() {
 
     let mut contract =
         helpers::contract("https://example.com/hook", vec![AlertRule::AnyTransaction]);
+    contract.horizon_base_url_override = Some(horizon.uri());
+    let cfg = AppConfig {
+        poll_interval_seconds: 3600,
+        contracts: vec![contract],
+        cursor_file: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+    };
+
+    let report = txwatch_poller::run_once(cfg, true)
+        .await
+        .expect("one rejected contract must not abort the whole cycle");
+    assert_eq!(report.transactions, 0);
+    assert_eq!(report.alerts, 0);
+    assert_eq!(report.poll_failures, 1);
+    assert!(!report.is_success());
+}
+
 /// Issue #5: the cursor file was read on startup but never written, so a
 /// restart replayed every transaction since the original cursor. This drives
 /// the real polling loop, then reads the file back and asserts the paging token
@@ -1345,6 +1366,48 @@ async fn cursor_file_is_persisted_after_a_poll_cycle() {
         poll_interval_seconds: 1,
         contracts: vec![contract.clone()],
         cursor_file: Some(cursor_file.display().to_string()),
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run =
+        tokio::spawn(
+            async move { txwatch_poller::run_with_shutdown(cfg, true, shutdown_rx).await },
+        );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let raw = loop {
+        if let Ok(text) = std::fs::read_to_string(&cursor_file) {
+            if text.contains("cursor-tok-1") {
+                break text;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cursor file never contained the served paging token: {}",
+            cursor_file.display()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let persisted: serde_json::Value = serde_json::from_str(&raw).expect("cursor file is JSON");
+    assert_eq!(
+        persisted[&contract.cursor_key()],
+        "cursor-tok-1",
+        "the served paging token must be persisted"
+    );
+    let tmp = cursor_file.with_extension("tmp");
+    assert!(!tmp.exists(), "temp file {} was left behind", tmp.display());
+
+    shutdown_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+    let _ = std::fs::remove_file(&cursor_file);
+}
+
 /// Issue #2: Horizon's transaction collection endpoints omit failed
 /// transactions unless `include_failed=true` is passed, which made the
 /// `TransactionFailed` rule unreachable in production. The matcher below only
@@ -1377,80 +1440,34 @@ async fn transactions_request_includes_failed() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
-    // A rejected contract fails its poll and is counted; it does not abort the
-    // cycle. So the operational symptom is a watch that never sees anything
-    // rather than a crash, which is what makes this worth pinning.
-    let report = txwatch_poller::run_once(cfg, true)
-        .await
-        .expect("one rejected contract must not abort the whole cycle");
-    assert_eq!(report.transactions, 0);
-    assert_eq!(report.alerts, 0);
-    assert_eq!(
-        report.poll_failures, 1,
-        "the rejected contract must be counted as a poll failure"
-    );
-    assert!(!report.is_success());
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let run =
-        tokio::spawn(
-            async move { txwatch_poller::run_with_shutdown(cfg, true, shutdown_rx).await },
-        );
-
-    // Wait for the first cycle to persist its cursor.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let raw = loop {
-        if let Ok(text) = std::fs::read_to_string(&cursor_file) {
-            if text.contains("cursor-tok-1") {
-                break text;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "cursor file never contained the served paging token: {}",
-            cursor_file.display()
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-
-    let persisted: serde_json::Value = serde_json::from_str(&raw).expect("cursor file is JSON");
-    assert_eq!(
-        persisted[&contract.contract_id], "cursor-tok-1",
-        "the served paging token must be persisted"
-    );
-    // Atomic write: no temp file is left behind.
-    let tmp = cursor_file.with_extension("tmp");
-    assert!(!tmp.exists(), "temp file {} was left behind", tmp.display());
-
-    shutdown_tx.send(true).unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
-    let _ = std::fs::remove_file(&cursor_file);
     // Dry run: this asserts the request we send, not the delivery path.
     let report = txwatch_poller::run_once(cfg, true).await.unwrap();
-    assert_eq!(
-        report.poll_failures, 0,
-        "the request must have matched the mock"
-    );
+    assert_eq!(report.poll_failures, 0, "the request must match the mock");
     assert_eq!(
         report.transactions, 1,
         "the failed transaction must be seen"
     );
 
     let requests = horizon.received_requests().await.unwrap();
-    let all: Vec<String> = requests.iter().map(|r| r.url.to_string()).collect();
-    // Only the collection endpoint carries this parameter; the
-    // per-transaction `/operations` fallback is a different endpoint.
+    let all: Vec<String> = requests
+        .iter()
+        .map(|request| request.url.to_string())
+        .collect();
     let collection: Vec<&String> = all
         .iter()
-        .filter(|u| u.contains("/accounts/") && u.contains("/transactions?"))
+        .filter(|url| url.contains("/accounts/") && url.contains("/transactions?"))
         .collect();
     assert!(
         !collection.is_empty(),
-        "expected a transactions collection request, got {all:?}"
+        "expected a transactions collection request"
     );
     assert!(
-        collection.iter().all(|u| u.contains("include_failed=true")),
-        "every transactions request must carry include_failed=true, got {collection:?}"
+        collection
+            .iter()
+            .all(|url| url.contains("include_failed=true")),
+        "every transactions request must carry include_failed=true"
     );
 }

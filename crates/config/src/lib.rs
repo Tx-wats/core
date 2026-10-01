@@ -1777,13 +1777,6 @@ impl AppConfig {
         }
 
         // Labels are already trimmed by `WatchedContract::collect_errors`; compare
-        // case-insensitively so "Vault" and "vault" count as duplicates.
-        let mut seen_labels = std::collections::HashSet::new();
-        let mut reported_labels = std::collections::HashSet::new();
-        for contract in &self.contracts {
-            let key = contract.label.to_lowercase();
-            if !seen_labels.insert(key.clone()) && reported_labels.insert(key) {
-        // Labels are already trimmed by `WatchedContract::collect_errors`; compare
         // case-insensitively so "Vault" and "vault" count as duplicates. Report each
         // offending label once even when it appears more than twice.
         let mut seen = std::collections::HashSet::new();
@@ -2160,9 +2153,13 @@ mod tests {
             threshold_xlm: 0,
             threshold_stroops: 0,
         })];
+        let mut first_valid = valid_contract();
+        first_valid.network = Network::Mainnet;
+        let mut second_valid = valid_contract();
+        second_valid.network = Network::Futurenet;
         let mut cfg = AppConfig {
             poll_interval_seconds: 1,
-            contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],
+            contracts: vec![bad_id, bad_rule, first_valid, second_valid],
             http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
@@ -2401,8 +2398,7 @@ mod tests {
 
     #[test]
     fn allows_same_contract_id_on_different_networks() {
-        let mut cfg: AppConfig =
-            toml::from_str(&two_contracts_toml("testnet", "mainnet")).unwrap();
+        let mut cfg: AppConfig = toml::from_str(&two_contracts_toml("testnet", "mainnet")).unwrap();
         cfg.validate().unwrap();
         assert_ne!(cfg.contracts[0].cursor_key(), cfg.contracts[1].cursor_key());
     }
@@ -2464,7 +2460,11 @@ mod tests {
                 toml::from_str(&format!("max_pages_per_cycle = {}\n{}", bad, MINIMAL_TOML))
                     .unwrap();
             let err = cfg.validate().unwrap_err().to_string();
-            assert!(err.contains("max_pages_per_cycle must be between 1 and"), "got: {}", err);
+            assert!(
+                err.contains("max_pages_per_cycle must be between 1 and"),
+                "got: {}",
+                err
+            );
         }
     }
 
@@ -3134,6 +3134,12 @@ mod tests {
             .map(|i| {
                 let mut c = valid_contract();
                 c.label = format!("c{}", i);
+                c.network = Network::Custom(CustomNetwork {
+                    horizon_url: format!("http://localhost:{}", 10_000 + i),
+                    explorer_url: None,
+                    passphrase: None,
+                    rpc_url: None,
+                });
                 c
             })
             .collect()
