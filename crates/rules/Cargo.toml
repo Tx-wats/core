@@ -35,7 +35,7 @@ stellar-xdr    = { version = "21", optional = true, default-features = false, fe
 [dev-dependencies]
 proptest   = "1"
 tokio      = { workspace = true, features = ["macros", "rt"] }
-criterion  = { version = "0.5", features = ["html_reports"] }
+criterion  = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name    = "evaluate"
