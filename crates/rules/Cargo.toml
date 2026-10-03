@@ -30,7 +30,7 @@ hex            = { workspace = true }
 # Backs the `soroban-xdr` feature. It has to be a real optional dependency
 # rather than a dev-dependency, because a dev-dependency cannot be optional and
 # the feature references it with `dep:`.
-stellar-xdr    = { version = "21", optional = true, default-features = false, features = ["std", "curr"] }
+stellar-xdr    = { version = "26", optional = true, default-features = false, features = ["std", "curr"] }
 
 [dev-dependencies]
 proptest   = "1"
