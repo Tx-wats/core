@@ -33,7 +33,7 @@ futures = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 
 [dev-dependencies]
 wiremock = { workspace = true }
