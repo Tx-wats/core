@@ -385,6 +385,7 @@ mod tests {
             amount_xlm_decimal: None,
             fee_charged_stroops: Some(50000),
             source_account: None,
+            fee_account: None,
             severity: None,
             timestamp: 1705320000,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),

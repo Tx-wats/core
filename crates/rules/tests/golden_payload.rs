@@ -56,6 +56,7 @@ fn golden_payload() -> AlertPayload {
         severity: None,
         ledger: None,
         source_account: None,
+        fee_account: None,
         memo: None,
         memo_type: None,
         operation_count: None,

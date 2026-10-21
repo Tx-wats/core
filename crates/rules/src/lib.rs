@@ -56,10 +56,13 @@ pub struct HorizonTransaction {
     pub paging_token: String,
     /// Fee charged in stroops (Horizon returns this as a string).
     pub fee_charged: Option<String>,
-    /// The Stellar account that submitted (signed) the transaction.
-    /// For fee-bump transactions, this is the fee-bump source account.
+    /// The account that signed the inner transaction. For fee-bump
+    /// transactions this is the inner source account; the account that
+    /// paid the fee is `fee_account`.
     pub source_account: Option<String>,
-    /// For fee-bump transactions, the inner source account.
+    /// The account that paid the transaction's fee. Equals
+    /// `source_account` for regular transactions; for fee-bump
+    /// transactions it is the fee-bump (outer) source account.
     pub fee_account: Option<String>,
     /// Base64-encoded XDR transaction envelope.
     pub envelope_xdr: Option<String>,
@@ -579,9 +582,14 @@ pub struct AlertPayload {
     pub amount_xlm_decimal: Option<String>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
-    /// The Stellar account that submitted the transaction (G-address).
+    /// The account that signed the inner transaction (G-address).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_account: Option<String>,
+    /// The account that paid the transaction's fee (G-address). Only
+    /// included when it differs from `source_account` — i.e. for
+    /// fee-bump transactions, where this is the fee-bump source account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_account: Option<String>,
     /// Optional severity level from the rule definition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity: Option<String>,
@@ -841,6 +849,51 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
         .filter_map(|(rule_index, entry)| {
             let rule: &AlertRule = entry.as_ref();
             match eval_rule(rule, tx) {
+                Ok(true) => Some(AlertPayload {
+                    schema_version: 1,
+                    alert_id: alert_id(contract_id, &tx.hash, &rule.label()),
+                    label: label.to_string(),
+                    contract_id: contract_id.to_string(),
+                    network: network.to_string(),
+                    // #44: Use the single canonical implementations from txwatch-config.
+                    rule_type: rule.rule_type().to_string(),
+                    rule_triggered: rule.label(),
+                    transaction_hash: tx.hash.clone(),
+                    function_name: tx.function_names.first().cloned(),
+                    function_names: tx.function_names.clone(),
+                    function_args: tx.invocations.clone(),
+                    amount_xlm,
+                    amount_stroops: tx.amount_stroops,
+                    amount_xlm_decimal: amount_xlm_decimal.clone(),
+                    fee_charged_stroops: tx.fee_charged_stroops,
+                    source_account: tx.source_account.clone(),
+                    // Only surface the fee payer when it differs from the
+                    // source account (fee-bump transactions, issue #251).
+                    fee_account: tx
+                        .fee_account
+                        .clone()
+                        .filter(|f| tx.source_account.as_deref() != Some(f.as_str())),
+                    // Per-rule delivery overrides, absent unless the rule sets them.
+                    severity: entry.severity().map(|s| s.to_string()),
+                    effective_webhook_url: entry.webhook_url().map(str::to_owned),
+                    effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
+                    timestamp,
+                    timestamp_iso: timestamp_iso.clone(),
+                    horizon_link: horizon_link.clone(),
+                    explorer_link: explorer_link.clone(),
+                    ledger: tx.ledger,
+                    memo: tx.memo.clone(),
+                    memo_type: tx.memo_type.clone(),
+                    operation_count: tx.operation_count,
+                    resolved: false,
+                    matched_events: matched_events(rule, tx),
+                    suppressed_count: 0,
+                    observed_count: None,
+                    test: false,
+                    old_wasm_hash: upgrade_hashes(rule, tx).and_then(|(o, _)| o),
+                    new_wasm_hash: upgrade_hashes(rule, tx).and_then(|(_, n)| n),
+                    enrichment_incomplete: tx.enrichment_incomplete,
+                }),
                 Ok(true) => {
                     let rule_type = rule.rule_type().to_string();
                     let rule_triggered = rule.label();
@@ -1047,7 +1100,15 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             allow,
             deny,
         } => {
-            match tx.source_account.as_deref() {
+            // `source_account` holds the inner source; `fee_account` holds the
+            // fee payer (the fee-bump source for fee-bump transactions).
+            let matched_account = match field {
+                txwatch_config::SourceAccountField::Source => tx.source_account.as_deref(),
+                txwatch_config::SourceAccountField::FeeAccount => {
+                    tx.fee_account.as_deref().or(tx.source_account.as_deref())
+                }
+            };
+            match matched_account {
                 None => false,
                 Some(src) => {
                     let list = if !accounts.is_empty() {
@@ -1224,6 +1285,12 @@ fn rule_label(rule: &AlertRule) -> String {
             allow,
             deny,
         } => {
+            // Only mention `field` when it is non-default so existing alert
+            // IDs (derived from the label) stay stable.
+            let field_str = match field {
+                txwatch_config::SourceAccountField::Source => "",
+                txwatch_config::SourceAccountField::FeeAccount => "field=fee_account, ",
+            };
             let list = if !accounts.is_empty() {
                 accounts
             } else if !alert_unless.is_empty() {
@@ -1366,6 +1433,7 @@ pub fn check_no_activity(
                 amount_stroops: None,
                 amount_xlm_decimal: None,
                 source_account: None,
+                fee_account: None,
                 severity: None,
                 effective_webhook_url: None,
                 effective_webhook_secret: None,
@@ -1429,6 +1497,7 @@ pub fn check_no_activity(
                 amount_stroops: None,
                 amount_xlm_decimal: None,
                 source_account: None,
+                fee_account: None,
                 severity: None,
                 effective_webhook_url: None,
                 effective_webhook_secret: None,
@@ -1649,6 +1718,7 @@ impl CooldownTracker {
                         amount_stroops: None,
                         amount_xlm_decimal: None,
                         source_account: None,
+                        fee_account: None,
                         severity: None,
                         effective_webhook_url: None,
                         effective_webhook_secret: None,
@@ -2547,6 +2617,7 @@ mod tests {
             amount_xlm_decimal: Some("15000.0000000".into()),
             fee_charged_stroops: Some(50000),
             source_account: Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()),
+            fee_account: None,
             severity: None,
             timestamp: 1705316096,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
@@ -2903,6 +2974,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec![],
                 alert_unless: vec![],
                 allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
@@ -2921,6 +2993,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec![],
                 alert_unless: vec![],
                 allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
@@ -2938,6 +3011,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec![],
                 alert_unless: vec![],
                 allow: vec![],
@@ -2955,6 +3029,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec![],
                 alert_unless: vec![],
                 allow: vec![],
@@ -2971,6 +3046,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec![],
                 alert_unless: vec![],
                 allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
@@ -2993,6 +3069,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::NotIn,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
                 alert_unless: vec![],
                 allow: vec![],
@@ -3011,6 +3088,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::NotIn,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
                 alert_unless: vec![],
                 allow: vec![],
@@ -3027,6 +3105,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::NotIn,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
                 alert_unless: vec![],
                 allow: vec![],
@@ -3047,6 +3126,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::NotIn,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec![],
                 alert_unless: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
                 allow: vec![],
@@ -3064,6 +3144,7 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
                 mode: txwatch_config::SourceAccountMode::NotIn,
+                field: txwatch_config::SourceAccountField::Source,
                 accounts: vec![],
                 alert_unless: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
                 allow: vec![],
@@ -3094,6 +3175,106 @@ mod tests {
         assert!(
             !obj.contains_key("test"),
             "real alerts must not carry the test marker"
+        );
+    }
+
+    // ── Issue #251: SourceAccount field="fee_account" and fee-bump payload ────
+
+    #[test]
+    fn source_account_field_fee_account_fires_on_fee_payer() {
+        let mut tx = make_tx(true, &[], None);
+        // Horizon fee-bump shape: inner source differs from the fee payer.
+        tx.source_account = Some("GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into());
+        tx.fee_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::FeeAccount,
+                accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "field=fee_account must match the fee payer of a fee-bump"
+        );
+    }
+
+    #[test]
+    fn source_account_field_fee_account_falls_back_to_source() {
+        let mut tx = make_tx(true, &[], None);
+        // Non-fee-bump: no fee_account, so fall back to source_account.
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::FeeAccount,
+                accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert_eq!(payloads.len(), 1);
+    }
+
+    #[test]
+    fn fee_account_included_in_payload_when_different_from_source() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into());
+        tx.fee_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        let payloads = run(&[entry(AlertRule::AnyTransaction)], &tx);
+        assert_eq!(
+            payloads[0].fee_account.as_deref(),
+            Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"),
+            "fee_account must ride along when it differs from source_account"
+        );
+        let obj = serde_json::to_value(&payloads[0]).unwrap();
+        let obj = obj.as_object().unwrap();
+        assert!(
+            obj.contains_key("fee_account"),
+            "fee_account present in JSON when it differs"
+        );
+    }
+
+    #[test]
+    fn fee_account_omitted_from_payload_when_same_as_source() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.fee_account = tx.source_account.clone();
+        let payloads = run(&[entry(AlertRule::AnyTransaction)], &tx);
+        assert_eq!(
+            payloads[0].fee_account, None,
+            "fee_account must be omitted when it equals source_account"
+        );
+        let obj = serde_json::to_value(&payloads[0]).unwrap();
+        let obj = obj.as_object().unwrap();
+        assert!(
+            !obj.contains_key("fee_account"),
+            "fee_account absent in JSON when it equals source_account"
+        );
+    }
+
+    #[test]
+    fn source_account_field_fee_account_label_mentions_field() {
+        use txwatch_config::{SourceAccountField, SourceAccountMode};
+        let label = rule_label(&AlertRule::SourceAccount {
+            mode: SourceAccountMode::In,
+            field: SourceAccountField::FeeAccount,
+            accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+            alert_unless: vec![],
+            allow: vec![],
+            deny: vec![],
+        });
+        assert!(
+            label.contains("field=fee_account"),
+            "label must distinguish fee_account rules, got: {}",
+            label
         );
     }
 
