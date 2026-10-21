@@ -49,7 +49,7 @@
         "rules": { "type": "array", "items": { "$ref": "#/$defs/AlertRule" }, "minItems": 1 }
       }
     },
-    "WebhookFormat": { "enum": ["txwatch", "slack", "discord", "pagerduty"], "default": "txwatch" },
+    "WebhookFormat": { "enum": ["txwatch", "slack", "discord", "pagerduty", "teams"], "default": "txwatch" },
     "WebhookHeaders": {
       "type": "object",
       "description": "Extra HTTP headers; values support ${ENV_VAR}. Content-Type, Content-Length and X-TxWatch-* are reserved.",

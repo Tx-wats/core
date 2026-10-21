@@ -1459,6 +1459,8 @@ pub enum WebhookFormat {
     Discord,
     /// PagerDuty Events API v2 `trigger` event; requires `routing_key`.
     Pagerduty,
+    /// Microsoft Teams Incoming Webhook / Workflows message with an Adaptive Card.
+    Teams,
     /// User-defined body rendered from `template` or `template_file`.
     Template,
 }
@@ -1470,6 +1472,7 @@ impl WebhookFormat {
             WebhookFormat::Slack => "slack",
             WebhookFormat::Discord => "discord",
             WebhookFormat::Pagerduty => "pagerduty",
+            WebhookFormat::Teams => "teams",
             WebhookFormat::Template => "template",
         }
     }
