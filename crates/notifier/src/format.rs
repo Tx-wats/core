@@ -7,6 +7,8 @@
 //!   mentions disabled so a label can never ping `@everyone`.
 //! - `pagerduty`: a PagerDuty Events API v2 `trigger` event whose `dedup_key`
 //!   is the alert's `alert_id`.
+//! - `teams`: a Microsoft Teams Incoming Webhook / Workflows message carrying
+//!   one Adaptive Card.
 //!
 //! Batched delivery (`batch_alerts = true`) renders a digest per destination
 //! via [`render_batch_body`]: chat formats get a single digest message and
@@ -36,6 +38,7 @@ pub fn render_body(
         WebhookFormat::Txwatch => serde_json::to_value(payload)?,
         WebhookFormat::Slack => slack(payload),
         WebhookFormat::Discord => discord(payload),
+        WebhookFormat::Teams => teams(payload),
         WebhookFormat::Pagerduty => pagerduty(
             payload,
             routing_key.ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?,
@@ -59,6 +62,7 @@ pub fn render_batch_body(
         WebhookFormat::Txwatch | WebhookFormat::Template => serde_json::to_value(payloads)?,
         WebhookFormat::Slack => slack_digest(payloads),
         WebhookFormat::Discord => discord_digest(payloads),
+        WebhookFormat::Teams => teams_digest(payloads),
         WebhookFormat::Pagerduty => {
             let key =
                 routing_key.ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?;
@@ -82,11 +86,18 @@ fn render_template(template: &str, payload: &AlertPayload) -> Result<String> {
         .render(minijinja::Value::from_serialize(payload))?)
 }
 
-/// One-line summary shared by the chat formats.
+/// One-line summary shared by the chat formats. A recovery notification
+/// (`resolved = true`) gets the "✅ Resolved" variant so it is never mistaken
+/// for the incident itself.
 fn headline(p: &AlertPayload) -> String {
+    let kind = if p.resolved {
+        "✅ Resolved"
+    } else {
+        "TxWatch alert"
+    };
     format!(
-        "TxWatch alert: {} on {} ({})",
-        p.rule_triggered, p.label, p.network
+        "{}: {} on {} ({})",
+        kind, p.rule_triggered, p.label, p.network
     )
 }
 
@@ -111,6 +122,44 @@ pub fn details(p: &AlertPayload) -> Vec<(&'static str, String)> {
     }
     if !p.function_names.is_empty() {
         details.push(("Functions", p.function_names.join(", ")));
+    }
+    if let Some(source) = p.source_account.as_deref() {
+        details.push(("Source", source.to_owned()));
+    }
+    if let Some(ledger) = p.ledger {
+        details.push(("Ledger", ledger.to_string()));
+    }
+    if let Some(memo) = p.memo.as_deref() {
+        let value = match p.memo_type.as_deref() {
+            Some(kind) => format!("{} ({})", memo, kind),
+            None => memo.to_owned(),
+        };
+        details.push(("Memo", value));
+    }
+    if let Some(severity) = p.severity.as_deref() {
+        details.push(("Severity", severity.to_owned()));
+    }
+    if p.suppressed_count > 0 {
+        details.push((
+            "Suppressed",
+            format!("{} similar alert(s)", p.suppressed_count),
+        ));
+    }
+    if !p.matched_events.is_empty() {
+        let names: Vec<String> = p
+            .matched_events
+            .iter()
+            .map(|e| match e.topics.first() {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Object(o)) if o.len() == 1 => match o.values().next() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => Value::Object(o.clone()).to_string(),
+                },
+                Some(other) => other.to_string(),
+                None => "(no topics)".to_owned(),
+            })
+            .collect();
+        details.push(("Events", names.join(", ")));
     }
     details
 }
@@ -150,9 +199,28 @@ fn slack_escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Severity emoji for the Slack headline: configured severity wins, falling
-/// back to the rule-type heuristic when unset.
+/// Makes a URL safe inside Slack `<url|text>` link markup: `&` is
+/// entity-escaped and `<`, `>`, `|` are percent-encoded so they can never end
+/// the link early.
+fn slack_url(url: &str) -> String {
+    url.replace('&', "&amp;")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace('|', "%7C")
+}
+
+/// Slack Block Kit limits; exceeding any of them makes Slack answer HTTP 400.
+const SLACK_TEXT_MAX: usize = 3000;
+const SLACK_FIELD_MAX: usize = 2000;
+const SLACK_FIELDS_MAX: usize = 10;
+
+/// Severity emoji for the Slack headline: resolved alerts get a check mark,
+/// otherwise configured severity wins, falling back to the rule-type heuristic
+/// when unset.
 fn slack_emoji(p: &AlertPayload) -> &'static str {
+    if p.resolved {
+        return ":white_check_mark:";
+    }
     match configured_severity(p) {
         Some("info") => ":information_source:",
         Some("warning") => ":warning:",
@@ -171,30 +239,44 @@ pub fn slack(p: &AlertPayload) -> Value {
         json!({ "type": "mrkdwn", "text": format!("*Contract*\n`{}`", p.contract_id) }),
         json!({
             "type": "mrkdwn",
-            "text": format!("*Transaction*\n<{}|{}>", p.explorer_link, p.transaction_hash),
+            "text": truncate(
+                &format!(
+                    "*Transaction*\n<{}|{}>",
+                    slack_url(&p.explorer_link),
+                    slack_escape(&p.transaction_hash)
+                ),
+                SLACK_FIELD_MAX,
+            ),
         }),
     ];
     for (name, value) in details(p) {
         fields.push(json!({
             "type": "mrkdwn",
-            "text": format!("*{}*\n{}", name, slack_escape(&value)),
+            "text": truncate(&format!("*{}*\n{}", name, slack_escape(&value)), SLACK_FIELD_MAX),
         }));
     }
+    // Keep room for the timestamp when the details overflow the field cap.
+    fields.truncate(SLACK_FIELDS_MAX - 1);
     fields.push(json!({ "type": "mrkdwn", "text": format!("*Time*\n{}", p.timestamp_iso) }));
 
+    let resolved = if p.resolved { "Resolved: " } else { "" };
     json!({
-        "text": slack_escape(&headline(p)),
+        "text": truncate(&slack_escape(&headline(p)), SLACK_TEXT_MAX),
         "blocks": [
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": format!(
-                        "{} *{}* on *{}* ({})",
-                        slack_emoji(p),
-                        slack_escape(&p.rule_triggered),
-                        slack_escape(&p.label),
-                        slack_escape(&p.network)
+                    "text": truncate(
+                        &format!(
+                            "{} {}*{}* on *{}* ({})",
+                            slack_emoji(p),
+                            resolved,
+                            slack_escape(&p.rule_triggered),
+                            slack_escape(&p.label),
+                            slack_escape(&p.network)
+                        ),
+                        SLACK_TEXT_MAX,
                     ),
                 },
             },
@@ -203,9 +285,14 @@ pub fn slack(p: &AlertPayload) -> Value {
                 "type": "context",
                 "elements": [{
                     "type": "mrkdwn",
-                    "text": format!(
-                        "<{}|Explorer> · <{}|Horizon> · alert `{}`",
-                        p.explorer_link, p.horizon_link, p.alert_id
+                    "text": truncate(
+                        &format!(
+                            "<{}|Explorer> · <{}|Horizon> · alert `{}`",
+                            slack_url(&p.explorer_link),
+                            slack_url(&p.horizon_link),
+                            p.alert_id
+                        ),
+                        SLACK_TEXT_MAX,
                     ),
                 }],
             },
@@ -222,8 +309,8 @@ pub fn slack_digest(payloads: &[AlertPayload]) -> Value {
             slack_escape(&p.rule_triggered),
             slack_escape(&p.label),
             slack_escape(&p.network),
-            p.explorer_link,
-            p.transaction_hash
+            slack_url(&p.explorer_link),
+            slack_escape(&p.transaction_hash)
         ));
     }
     let summary = format!("TxWatch: {} alert(s)", payloads.len());
@@ -236,7 +323,7 @@ pub fn slack_digest(payloads: &[AlertPayload]) -> Value {
             },
             {
                 "type": "section",
-                "text": { "type": "mrkdwn", "text": lines.join("\n") },
+                "text": { "type": "mrkdwn", "text": truncate(&lines.join("\n"), SLACK_TEXT_MAX) },
             },
         ],
     })
@@ -247,6 +334,9 @@ pub fn slack_digest(payloads: &[AlertPayload]) -> Value {
 /// Embed colour: configured severity wins (info→blue, warning→amber,
 /// critical→red), falling back to the rule-type heuristic when unset.
 fn discord_color(p: &AlertPayload) -> u32 {
+    if p.resolved {
+        return 0x2E_CC_71;
+    }
     match configured_severity(p) {
         Some("info") => 0x34_98_DB,
         Some("warning") => 0xF1_C4_0F,
@@ -282,7 +372,14 @@ pub fn discord(p: &AlertPayload) -> Value {
         "content": truncate(&headline(p), 2000),
         "allowed_mentions": { "parse": [] },
         "embeds": [{
-            "title": truncate(&p.rule_triggered, 256),
+            "title": truncate(
+                &if p.resolved {
+                    format!("✅ Resolved: {}", p.rule_triggered)
+                } else {
+                    p.rule_triggered.clone()
+                },
+                256,
+            ),
             "url": p.explorer_link,
             "description": truncate(&format!("{} ({})", p.label, p.network), 4096),
             "color": discord_color(p),
@@ -313,6 +410,104 @@ pub fn discord_digest(payloads: &[AlertPayload]) -> Value {
             "footer": { "text": "TxWatch" },
         }],
     })
+}
+
+// ── Microsoft Teams ───────────────────────────────────────────────────────────
+
+/// Wraps an Adaptive Card body in the message envelope accepted by Teams
+/// Incoming Webhooks and Workflows ("Post to a channel when a webhook request
+/// is received").
+fn teams_message(body: Vec<Value>, actions: Vec<Value>) -> Value {
+    json!({
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": null,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "msteams": { "width": "Full" },
+                "body": body,
+                "actions": actions,
+            },
+        }],
+    })
+}
+
+/// Headline colour: resolved → good, otherwise by severity.
+fn teams_color(p: &AlertPayload) -> &'static str {
+    if p.resolved {
+        return "Good";
+    }
+    match discord_color(p) {
+        0xE7_4C_3C => "Attention",
+        0xF1_C4_0F => "Warning",
+        _ => "Accent",
+    }
+}
+
+/// Microsoft Teams message with one Adaptive Card.
+pub fn teams(p: &AlertPayload) -> Value {
+    let mut facts = vec![
+        json!({ "title": "Contract", "value": p.contract_id }),
+        json!({ "title": "Transaction", "value": p.transaction_hash }),
+    ];
+    for (name, value) in details(p) {
+        facts.push(json!({ "title": name, "value": value }));
+    }
+    facts.push(json!({ "title": "Time", "value": p.timestamp_iso }));
+
+    teams_message(
+        vec![
+            json!({
+                "type": "TextBlock",
+                "text": headline(p),
+                "weight": "Bolder",
+                "size": "Medium",
+                "color": teams_color(p),
+                "wrap": true,
+            }),
+            json!({ "type": "FactSet", "facts": facts }),
+            json!({
+                "type": "TextBlock",
+                "text": format!("alert {}", p.alert_id),
+                "isSubtle": true,
+                "size": "Small",
+                "wrap": true,
+            }),
+        ],
+        vec![
+            json!({ "type": "Action.OpenUrl", "title": "Explorer", "url": p.explorer_link }),
+            json!({ "type": "Action.OpenUrl", "title": "Horizon", "url": p.horizon_link }),
+        ],
+    )
+}
+
+/// Microsoft Teams digest message summarising a batch of alerts.
+pub fn teams_digest(payloads: &[AlertPayload]) -> Value {
+    let facts: Vec<Value> = payloads
+        .iter()
+        .map(|p| {
+            json!({
+                "title": format!("{} on {} ({})", p.rule_triggered, p.label, p.network),
+                "value": format!("[{}]({})", p.transaction_hash, p.explorer_link),
+            })
+        })
+        .collect();
+    teams_message(
+        vec![
+            json!({
+                "type": "TextBlock",
+                "text": format!("TxWatch: {} alert(s)", payloads.len()),
+                "weight": "Bolder",
+                "size": "Medium",
+                "wrap": true,
+            }),
+            json!({ "type": "FactSet", "facts": facts }),
+        ],
+        vec![],
+    )
 }
 
 // ── PagerDuty ─────────────────────────────────────────────────────────────────
@@ -546,6 +741,158 @@ mod tests {
     fn pagerduty_requires_a_routing_key() {
         let err = render_body(WebhookFormat::Pagerduty, &fixture(), None, None).unwrap_err();
         assert!(err.to_string().contains("routing_key"), "got: {}", err);
+    }
+
+    #[test]
+    fn slack_enforces_block_kit_limits() {
+        let mut p = fixture();
+        p.rule_triggered = "x".repeat(5000);
+        p.function_names = vec!["f".repeat(3000)];
+        p.source_account = Some("G".into());
+        p.ledger = Some(1);
+        p.memo = Some("m".into());
+        p.severity = Some("critical".into());
+        p.suppressed_count = 2;
+        p.amount_xlm_decimal = Some("1.5".into());
+        let slack = render(WebhookFormat::Slack, &p);
+        let blocks = &slack["blocks"];
+        assert!(blocks[0]["text"]["text"].as_str().unwrap().chars().count() <= 3000);
+        let fields = blocks[1]["fields"].as_array().unwrap();
+        assert!(fields.len() <= 10);
+        assert!(fields
+            .iter()
+            .all(|f| f["text"].as_str().unwrap().chars().count() <= 2000));
+        assert!(fields.last().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("*Time*"));
+
+        let digest = render_batch_body(WebhookFormat::Slack, &vec![p; 50], None).unwrap();
+        let digest: Value = serde_json::from_str(&digest).unwrap();
+        assert!(
+            digest["blocks"][1]["text"]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= 3000
+        );
+    }
+
+    #[test]
+    fn slack_link_urls_are_escaped() {
+        let mut p = fixture();
+        p.explorer_link = "https://x.example/tx?a=1&b=<2>|3".into();
+        let slack = render(WebhookFormat::Slack, &p);
+        let tx = slack["blocks"][1]["fields"][1]["text"].as_str().unwrap();
+        assert_eq!(
+            tx,
+            "*Transaction*\n<https://x.example/tx?a=1&amp;b=%3C2%3E%7C3|abc123>"
+        );
+        let context = slack["blocks"][2]["elements"][0]["text"].as_str().unwrap();
+        assert!(context.starts_with("<https://x.example/tx?a=1&amp;b=%3C2%3E%7C3|Explorer>"));
+    }
+
+    #[test]
+    fn resolved_alerts_use_the_resolved_headline_and_extra_details() {
+        let mut p = fixture();
+        p.resolved = true;
+        p.source_account = Some("GSOURCE".into());
+        p.ledger = Some(42);
+        p.memo = Some("invoice-7".into());
+        p.memo_type = Some("text".into());
+        p.severity = Some("warning".into());
+        p.suppressed_count = 3;
+
+        let slack = render(WebhookFormat::Slack, &p);
+        assert!(slack["text"].as_str().unwrap().starts_with("✅ Resolved"));
+        assert!(slack["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(":white_check_mark: Resolved:"));
+
+        let discord = render(WebhookFormat::Discord, &p);
+        assert_eq!(discord["embeds"][0]["color"], 0x2E_CC_71);
+        let names: Vec<&str> = discord["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Contract",
+                "Transaction",
+                "Fee",
+                "Functions",
+                "Source",
+                "Ledger",
+                "Memo",
+                "Severity",
+                "Suppressed",
+                "Horizon"
+            ]
+        );
+    }
+
+    #[test]
+    fn teams_renders_an_adaptive_card() {
+        let mut p = fixture();
+        p.function_names.clear();
+        p.fee_charged_stroops = None;
+        let expected = snapshot(
+            r#"{
+              "type": "message",
+              "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": null,
+                "content": {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  "type": "AdaptiveCard",
+                  "version": "1.4",
+                  "msteams": { "width": "Full" },
+                  "body": [
+                    {
+                      "type": "TextBlock",
+                      "text": "TxWatch alert: LargeTransfer(>=10000XLM) on Escrow <main> & co (testnet)",
+                      "weight": "Bolder",
+                      "size": "Medium",
+                      "color": "Accent",
+                      "wrap": true
+                    },
+                    {
+                      "type": "FactSet",
+                      "facts": [
+                        { "title": "Contract", "value": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+                        { "title": "Transaction", "value": "abc123" },
+                        { "title": "Time", "value": "2024-01-15T12:00:00Z" }
+                      ]
+                    },
+                    {
+                      "type": "TextBlock",
+                      "text": "alert 3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
+                      "isSubtle": true,
+                      "size": "Small",
+                      "wrap": true
+                    }
+                  ],
+                  "actions": [
+                    { "type": "Action.OpenUrl", "title": "Explorer", "url": "https://stellar.expert/explorer/testnet/tx/abc123" },
+                    { "type": "Action.OpenUrl", "title": "Horizon", "url": "https://horizon-testnet.stellar.org/transactions/abc123" }
+                  ]
+                }
+              }]
+            }"#,
+        );
+        assert_eq!(render(WebhookFormat::Teams, &p), expected);
+
+        let digest =
+            render_batch_body(WebhookFormat::Teams, &[fixture(), fixture()], None).unwrap();
+        let digest: Value = serde_json::from_str(&digest).unwrap();
+        let card = &digest["attachments"][0]["content"];
+        assert_eq!(card["body"][0]["text"], "TxWatch: 2 alert(s)");
+        assert_eq!(card["body"][1]["facts"].as_array().unwrap().len(), 2);
     }
 
     #[test]
