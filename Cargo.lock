@@ -1266,12 +1266,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "memo-map"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5449c8c750f1a07ea702bbd212bd999fceece9b3d1508b17023b3e174583124b"
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1279,14 +1273,9 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "minijinja"
-version = "2.24.0"
+version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
-dependencies = [
- "memo-map",
- "serde",
- "serde_json",
-]
+checksum = "90086695417a271bc96e6cb50618555614ca48fa3bb0d9aa96e3468b0f84431e"
 
 [[package]]
 name = "mio"
@@ -2535,6 +2524,7 @@ dependencies = [
  "txwatch-config",
  "txwatch-notifier",
  "txwatch-poller",
+ "txwatch-rules",
  "wiremock",
 ]
 
@@ -2550,7 +2540,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
- "sha2 0.11.1",
+ "sha2",
  "toml",
  "url",
 ]
@@ -2567,6 +2557,7 @@ dependencies = [
  "minijinja",
  "reqwest",
  "rustls",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -2611,6 +2602,7 @@ dependencies = [
  "criterion",
  "hex",
  "proptest",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
