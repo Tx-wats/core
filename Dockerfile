@@ -3,7 +3,7 @@
 # bump them deliberately (e.g. via Dependabot's docker ecosystem).
 
 # Builder stage: compile the txwatch binary
-FROM rust:1.99.0-alpine3.24@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS builder
+FROM rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS builder
 WORKDIR /build
 # .dockerignore excludes .git/, so build.rs cannot run `git rev-parse` here.
 # Pass the SHA and timestamp in as build args so `txwatch --version` reports
