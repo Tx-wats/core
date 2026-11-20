@@ -69,8 +69,7 @@ pub fn acquire_state_lock(cursor_file: Option<&str>) -> Result<StateLock> {
 }
 
 pub fn load_state(cfg: &AppConfig) -> StateDocument {
-    let path = cfg.state_file.as_deref().or(cfg.cursor_file.as_deref());
-    let Some(path) = path else {
+    let Some(path) = state_path(cfg) else {
         return StateDocument::default();
     };
     let Ok(content) = fs::read_to_string(path) else {
@@ -115,8 +114,7 @@ pub fn prune_state(cfg: &AppConfig, mut doc: StateDocument) -> StateDocument {
 }
 
 pub fn save_state(cfg: &AppConfig, doc: &StateDocument) -> Result<()> {
-    let path = cfg.state_file.as_deref().or(cfg.cursor_file.as_deref());
-    let Some(path) = path else {
+    let Some(path) = state_path(cfg) else {
         return Ok(());
     };
     write_state_blocking(Path::new(path), doc)
@@ -199,20 +197,48 @@ pub struct StateUpdate {
     pub no_activity: HashMap<String, NoActivityState>,
 }
 
+/// Messages understood by the state writer task.
+enum WriterMessage {
+    /// Merge one contract's latest state into the document and write it.
+    Update(StateUpdate),
+    /// Replace the whole document (e.g. the full snapshot taken on shutdown
+    /// or reload) and write it.
+    Replace(StateDocument),
+    /// Acknowledge once every earlier message has been written.
+    Flush(tokio::sync::oneshot::Sender<()>),
+    /// Stop after every earlier message has been written. Explicit, so
+    /// shutdown does not depend on every `StateHandle` clone being dropped.
+    Shutdown,
+}
+
 #[derive(Clone)]
 pub struct StateHandle {
-    sender: Option<tokio::sync::mpsc::UnboundedSender<StateUpdate>>,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<WriterMessage>>,
 }
 
 impl StateHandle {
     pub fn send(&self, update: StateUpdate) {
         if let Some(s) = &self.sender {
-            let _ = s.send(update);
+            let _ = s.send(WriterMessage::Update(update));
         }
     }
 
+    /// Replace the persisted document with `doc`. Issue #438: used for the
+    /// shutdown/reload flush so cooldown and NoActivity state are written
+    /// alongside every contract's cursor instead of being dropped.
+    pub fn replace(&self, doc: StateDocument) {
+        if let Some(s) = &self.sender {
+            let _ = s.send(WriterMessage::Replace(doc));
+        }
+    }
+
+    /// Wait until every message sent before this call has been written.
     pub async fn flush(&self) {
-        tokio::task::yield_now().await;
+        let Some(s) = &self.sender else { return };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if s.send(WriterMessage::Flush(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 }
 
@@ -227,33 +253,222 @@ impl StateWriter {
     }
 
     pub async fn shutdown(mut self) {
-        self.handle.sender.take();
+        if let Some(sender) = self.handle.sender.take() {
+            let _ = sender.send(WriterMessage::Shutdown);
+        }
         if let Some(join) = self.join_handle.take() {
             let _ = join.await;
         }
     }
 }
 
-pub fn spawn_state_writer(cursor_file: Option<&str>) -> StateWriter {
-    let Some(path_str) = cursor_file else {
+/// The file the state document is read from and written to: `state_file`,
+/// falling back to `cursor_file`. Loading and writing must agree on this.
+pub fn state_path(cfg: &AppConfig) -> Option<&str> {
+    cfg.state_file.as_deref().or(cfg.cursor_file.as_deref())
+}
+
+/// Spawn the single task that owns writes to `state_path`.
+///
+/// Issue #439: the writer starts from `initial` (the document loaded at
+/// startup) rather than an empty document, so the first write after startup
+/// keeps every other contract's saved cursor, cooldowns and NoActivity state.
+pub fn spawn_state_writer(state_path: Option<&str>, initial: StateDocument) -> StateWriter {
+    let Some(path_str) = state_path else {
         return StateWriter {
             handle: StateHandle { sender: None },
             join_handle: None,
         };
     };
     let path = PathBuf::from(path_str);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StateUpdate>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WriterMessage>();
     let join = tokio::spawn(async move {
-        let mut current_doc = StateDocument::default();
-        while let Some(update) = rx.recv().await {
-            current_doc.cursors.insert(update.cursor_key.clone(), update.cursor);
-            current_doc.cooldowns.insert(update.cursor_key.clone(), update.cooldowns);
-            current_doc.no_activity.insert(update.cursor_key, update.no_activity);
+        let mut current_doc = initial;
+        while let Some(message) = rx.recv().await {
+            match message {
+                WriterMessage::Update(update) => {
+                    current_doc
+                        .cursors
+                        .insert(update.cursor_key.clone(), update.cursor);
+                    current_doc
+                        .cooldowns
+                        .insert(update.cursor_key.clone(), update.cooldowns);
+                    current_doc
+                        .no_activity
+                        .insert(update.cursor_key, update.no_activity);
+                }
+                WriterMessage::Replace(doc) => current_doc = doc,
+                WriterMessage::Flush(ack) => {
+                    let _ = ack.send(());
+                    continue;
+                }
+                WriterMessage::Shutdown => break,
+            }
             let _ = write_state_blocking(&path, &current_doc);
         }
     });
     StateWriter {
         handle: StateHandle { sender: Some(tx) },
         join_handle: Some(join),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_state_path(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "txwatch_persistence_{}_{}_{}.json",
+            name,
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    fn read_doc(path: &Path) -> StateDocument {
+        serde_json::from_str(&fs::read_to_string(path).expect("state file written"))
+            .expect("state file is a StateDocument")
+    }
+
+    fn update(key: &str, cursor: &str) -> StateUpdate {
+        StateUpdate {
+            cursor_key: key.into(),
+            cursor: cursor.into(),
+            cooldowns: CooldownTracker::new(),
+            no_activity: Vec::new(),
+        }
+    }
+
+    /// Issue #439: with several contracts on disk, the first write after
+    /// startup must not drop the contracts that have not advanced yet, even
+    /// when the process then crashes without a graceful shutdown.
+    #[tokio::test]
+    async fn writer_keeps_every_contract_cursor_across_a_crash() {
+        let path = temp_state_path("multi_contract_crash");
+        let mut loaded = StateDocument::default();
+        for (key, cursor) in [
+            ("testnet:A", "100"),
+            ("testnet:B", "200"),
+            ("mainnet:C", "300"),
+        ] {
+            loaded.cursors.insert(key.into(), cursor.into());
+        }
+        let mut cooldowns = CooldownTracker::new();
+        cooldowns.check("B", "AnyTransaction", 3600, chrono::Utc::now());
+        loaded.cooldowns.insert("testnet:B".into(), cooldowns);
+        loaded.no_activity.insert(
+            "mainnet:C".into(),
+            HashMap::from([("rule".to_string(), NoActivityState::default())]),
+        );
+        write_state_blocking(&path, &loaded).unwrap();
+
+        let writer = spawn_state_writer(path.to_str(), loaded.clone());
+        let handle = writer.handle();
+        // Only contract A advances before the "crash".
+        handle.send(update("testnet:A", "150"));
+        handle.flush().await;
+        // Crash: the writer task is torn down without a graceful shutdown.
+        if let Some(join) = writer.join_handle.as_ref() {
+            join.abort();
+        }
+
+        let on_disk = read_doc(&path);
+        assert_eq!(
+            on_disk.cursors.get("testnet:A").map(String::as_str),
+            Some("150")
+        );
+        assert_eq!(
+            on_disk.cursors.get("testnet:B").map(String::as_str),
+            Some("200")
+        );
+        assert_eq!(
+            on_disk.cursors.get("mainnet:C").map(String::as_str),
+            Some("300")
+        );
+        assert!(
+            on_disk.cooldowns.contains_key("testnet:B"),
+            "B's cooldowns lost"
+        );
+        assert!(
+            on_disk.no_activity.contains_key("mainnet:C"),
+            "C's NoActivity lost"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `replace` swaps the whole document and later updates build on it.
+    #[tokio::test]
+    async fn writer_replace_then_update_keeps_the_replaced_document() {
+        let path = temp_state_path("replace");
+        let writer = spawn_state_writer(path.to_str(), StateDocument::default());
+        let handle = writer.handle();
+
+        let mut full = StateDocument::default();
+        full.cursors.insert("testnet:A".into(), "1".into());
+        full.cursors.insert("testnet:B".into(), "2".into());
+        handle.replace(full);
+        handle.send(update("testnet:B", "3"));
+        writer.shutdown().await;
+
+        let on_disk = read_doc(&path);
+        assert_eq!(
+            on_disk.cursors.get("testnet:A").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            on_disk.cursors.get("testnet:B").map(String::as_str),
+            Some("3")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `flush` returns only after earlier messages are on disk.
+    #[tokio::test]
+    async fn flush_waits_for_pending_writes() {
+        let path = temp_state_path("flush");
+        let writer = spawn_state_writer(path.to_str(), StateDocument::default());
+        let handle = writer.handle();
+        for i in 0..50 {
+            handle.send(update("testnet:A", &i.to_string()));
+        }
+        handle.flush().await;
+        assert_eq!(
+            read_doc(&path).cursors.get("testnet:A").map(String::as_str),
+            Some("49")
+        );
+        writer.shutdown().await;
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Without a state path the writer is a no-op and `flush` still returns.
+    #[tokio::test]
+    async fn writer_without_path_is_a_no_op() {
+        let writer = spawn_state_writer(None, StateDocument::default());
+        let handle = writer.handle();
+        handle.send(update("testnet:A", "1"));
+        handle.flush().await;
+        writer.shutdown().await;
+    }
+
+    /// Shutdown completes even while other `StateHandle` clones are alive
+    /// (the reload loop keeps one for the whole run).
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_outstanding_handles() {
+        let path = temp_state_path("shutdown");
+        let writer = spawn_state_writer(path.to_str(), StateDocument::default());
+        let outstanding = writer.handle();
+        outstanding.send(update("testnet:A", "9"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer.shutdown())
+            .await
+            .expect("shutdown hung while a handle clone was alive");
+        assert_eq!(
+            read_doc(&path).cursors.get("testnet:A").map(String::as_str),
+            Some("9")
+        );
+        drop(outstanding);
+        let _ = fs::remove_file(&path);
     }
 }
