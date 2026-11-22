@@ -597,8 +597,15 @@ pub async fn run_with_reload(
                         new_path = %new.display(),
                         "cursor_file changed on reload — migrating saved cursors"
                     );
-                    if let Err(e) = write_cursor_file(new, &lock(&cursors)) {
-                        error!(error = %e, "failed to migrate cursors to the new cursor_file");
+                    // Issue #450: migrate the whole state document, not just the
+                    // cursors, so cooldowns and NoActivity state are not dropped.
+                    if let Err(e) = write_migrated_state(
+                        new,
+                        lock(&cursors).clone(),
+                        lock(&cooldown_state).clone(),
+                        lock(&no_activity_state).clone(),
+                    ) {
+                        error!(error = %e, "failed to migrate state to the new cursor_file");
                     }
                 }
                 (Some(old), None) => warn!(
@@ -986,15 +993,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Write the cursor map to `path` atomically: a temp file in the same directory
-/// is written and fsynced, then renamed over the target, and the directory is
-/// fsynced so the rename itself survives a crash. An interrupted write
-/// therefore leaves the previous file intact rather than a truncated one.
+/// Write the full state (cursors, cooldowns and NoActivity states) to `path`
+/// atomically (see [`persistence::write_state_blocking`]). Used when a reload
+/// migrates to a new `cursor_file` (issue #450).
 ///
 /// Issue #278: this is synchronous and must only be called from a blocking
-/// context (see [`persistence::write_state_blocking`]).
-fn write_cursor_file(path: &Path, cursors: &HashMap<String, String>) -> Result<()> {
-    let doc = StateDocument::from_cursors(cursors.clone());
+/// context.
+fn write_migrated_state(
+    path: &Path,
+    cursors: HashMap<String, String>,
+    cooldowns: HashMap<String, CooldownTracker>,
+    no_activity: HashMap<String, HashMap<String, NoActivityState>>,
+) -> Result<()> {
+    let doc = StateDocument::from_parts(cursors, cooldowns, no_activity);
     persistence::write_state_blocking(path, &doc)
 }
 
@@ -4671,5 +4682,35 @@ mod amount_and_cursor_tests {
         let migrated =
             migrate_saved_cursors(saved(&[(other, "9")]), &configured(&[(key.as_str(), ID)]));
         assert_eq!(migrated.get(other).map(String::as_str), Some("9"));
+    }
+}
+
+#[cfg(test)]
+mod migrated_state_tests {
+    use super::*;
+
+    // Issue #450: migrating to a new cursor_file must carry cooldowns along.
+    #[test]
+    fn write_migrated_state_keeps_cooldowns() {
+        let dir = std::env::temp_dir().join(format!("txwatch-450-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let cooldown: CooldownTracker = serde_json::from_value(serde_json::json!([
+            [["C1", "rule"], {"last_fired": "2026-01-01T00:00:00Z", "suppressed": 2}]
+        ]))
+        .unwrap();
+        let mut cursors = HashMap::new();
+        cursors.insert("C1".to_string(), "42".to_string());
+        let mut cooldowns = HashMap::new();
+        cooldowns.insert("C1".to_string(), cooldown);
+
+        write_migrated_state(&path, cursors, cooldowns, HashMap::new()).unwrap();
+
+        let doc: StateDocument =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc.cursors.get("C1").map(String::as_str), Some("42"));
+        assert!(doc.cooldowns.contains_key("C1"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
