@@ -29,6 +29,7 @@ anyhow           = { workspace = true }
 tracing          = { workspace = true }
 chrono           = { workspace = true }
 futures          = { workspace = true }
+tempfile         = "3.0"
 prometheus       = { version = "0.14", optional = true }
 hyper            = { version = "1", features = ["http1", "server"], optional = true }
 hyper-util       = { version = "0.1", features = ["tokio"], optional = true }

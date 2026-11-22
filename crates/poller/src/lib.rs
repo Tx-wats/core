@@ -32,8 +32,8 @@ pub mod event_stream;
 pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
 pub mod persistence;
 pub use persistence::{
-    acquire_state_lock, load_state, save_state, spawn_state_writer, StateDocument, StateHandle,
-    StateWriter,
+    acquire_state_lock, load_state, save_state, spawn_state_writer, write_state_blocking,
+    StateDocument, StateHandle, StateWriter,
 };
 mod poll_health;
 use poll_health::{jitter_percent_from_env, poll_ticker, start_offset, PollHealth};
