@@ -307,6 +307,11 @@ enum Command {
     Cursors {
         #[command(subcommand)]
         action: CursorsAction,
+
+        /// Proceed even if another TxWatch instance holds the state lock.
+        /// Edits made while `watch` is running may be overwritten by it.
+        #[arg(long, global = true)]
+        force: bool,
     },
 
     /// Remove saved cursor entries for contracts that are no longer configured
@@ -877,18 +882,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Cursors { action } => {
+        Command::Cursors { action, force } => {
             let cfg = load_config(&cli)?;
             let cursor_file = cfg.cursor_file.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("cursor_file is not set in the config; no cursors to manage")
             })?;
-            let lock_path = format!("{}.lock", cursor_file);
-            if std::path::Path::new(&lock_path).exists() {
-                return Err(anyhow::anyhow!(
-                    "A TxWatch instance is running (lock file '{}' exists). Stop it before editing cursors.",
-                    lock_path
-                ));
-            }
+            // #442: check by trying to take the same lock `watch` holds, not by
+            // whether the lock file exists. The OS releases the lock when its
+            // owner dies, so a file left behind by a crash never blocks this.
+            // Holding the lock for the edit also stops `watch` starting midway.
+            let _state_lock = cursors_state_lock(cfg.state_path(), force)?;
             let cursor_path = std::path::Path::new(cursor_file);
             let mut cursors: std::collections::BTreeMap<String, String> = if cursor_path.exists() {
                 let raw = fs::read_to_string(cursor_path)
@@ -2257,5 +2260,68 @@ fn init_tracing(format: LogFormat) {
             .with_current_span(true)
             .with_span_list(true)
             .init(),
+    }
+}
+
+/// Take the state lock for `txwatch cursors` (#442). A lock held by a running
+/// instance is an error naming its PID, unless `force` is set, in which case
+/// the command warns and proceeds without the lock.
+fn cursors_state_lock(
+    state_path: Option<&str>,
+    force: bool,
+) -> anyhow::Result<Option<txwatch_poller::StateLock>> {
+    match txwatch_poller::acquire_state_lock(state_path) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(err) => match err.downcast_ref::<txwatch_poller::StateLockHeld>() {
+            Some(held) if force => {
+                eprintln!("warning: {held}; continuing because --force was given");
+                Ok(None)
+            }
+            Some(held) => Err(anyhow::anyhow!(
+                "{held}. Stop it before editing cursors, or pass --force."
+            )),
+            None => Err(err),
+        },
+    }
+}
+
+#[cfg(test)]
+mod cursors_lock_tests {
+    use super::cursors_state_lock;
+
+    fn temp_state(name: &str) -> String {
+        let path =
+            std::env::temp_dir().join(format!("txwatch_cli_{}_{}.json", name, std::process::id()));
+        let _ = std::fs::remove_file(txwatch_poller::state_lock_path(path.to_str().unwrap()));
+        path.display().to_string()
+    }
+
+    /// #442: a running instance blocks `txwatch cursors`, naming the lock.
+    #[test]
+    fn held_lock_blocks_cursors_without_force() {
+        let state = temp_state("held");
+        let _running = txwatch_poller::acquire_state_lock(Some(&state)).unwrap();
+        let err = cursors_state_lock(Some(&state), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holds the state lock"), "{err}");
+        assert!(err.contains("--force"), "{err}");
+    }
+
+    /// #442: `--force` is the escape hatch.
+    #[test]
+    fn force_proceeds_while_the_lock_is_held() {
+        let state = temp_state("force");
+        let _running = txwatch_poller::acquire_state_lock(Some(&state)).unwrap();
+        assert!(cursors_state_lock(Some(&state), true).unwrap().is_none());
+    }
+
+    /// #442: a lock file left behind by a crash (no live owner) never blocks.
+    #[test]
+    fn stale_lock_file_does_not_block_cursors() {
+        let state = temp_state("stale");
+        std::fs::write(txwatch_poller::state_lock_path(&state), "424242\n").unwrap();
+        let lock = cursors_state_lock(Some(&state), false).unwrap();
+        assert!(lock.is_some_and(|l| l.is_held()));
     }
 }

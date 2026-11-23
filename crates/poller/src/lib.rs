@@ -32,8 +32,8 @@ pub mod event_stream;
 pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
 pub mod persistence;
 pub use persistence::{
-    acquire_state_lock, load_state, save_state, spawn_state_writer, StateDocument, StateHandle,
-    StateWriter,
+    acquire_state_lock, load_state, save_state, spawn_state_writer, state_lock_path, StateDocument,
+    StateHandle, StateLock, StateLockHeld, StateWriter,
 };
 mod poll_health;
 use poll_health::{jitter_percent_from_env, poll_ticker, start_offset, PollHealth};
@@ -358,10 +358,11 @@ pub async fn run_with_reload(
 ) -> Result<()> {
     // `build_poll_client` applies `http_tcp_keepalive_secs` itself.
     let client = build_poll_client(&cfg)?;
-    // Issue #279: take an exclusive advisory lock on `<cursor_file>.lock` so a
+    // Issue #279 / #441: take an exclusive OS lock on `<state path>.lock` so a
     // second instance pointed at the same file fails fast instead of silently
-    // overwriting our cursors. The guard lives for the whole process.
-    let _state_lock = acquire_state_lock(cfg.cursor_file.as_deref())?;
+    // overwriting our state. The guard lives for the whole run.
+    // Issue #440: the lock, loader and writer all use `AppConfig::state_path`.
+    let _state_lock = acquire_state_lock(cfg.state_path())?;
     // Issue #281: load the versioned state document (cursors, cooldowns and
     // NoActivity states), migrating a legacy cursor-only file if needed.
     // Issue #375: this is the single source of truth for start-up state.
@@ -371,7 +372,7 @@ pub async fn run_with_reload(
     let cursors = Arc::new(Mutex::new(loaded.cursors.clone()));
     // Issue #278: a single coalescing writer task owns the fsync path, so no
     // poll task blocks a worker on synchronous disk I/O.
-    let state_writer = spawn_state_writer(cfg.cursor_file.as_deref());
+    let state_writer = spawn_state_writer(cfg.state_path());
     let state_handle = state_writer.handle();
     let cooldown_state = Arc::new(Mutex::new(loaded.cooldowns.clone()));
     let no_activity_state = Arc::new(Mutex::new(loaded.no_activity.clone()));
@@ -382,7 +383,7 @@ pub async fn run_with_reload(
         Arc::new(Mutex::new(HashMap::new()));
     // Issue #276: the persistence path is recomputed from the active config
     // each generation rather than captured once here.
-    let mut cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
+    let mut cursor_file = cfg.state_path().map(PathBuf::from);
 
     #[cfg(feature = "metrics")]
     {
@@ -588,7 +589,7 @@ pub async fn run_with_reload(
 
         // Issue #276: recompute the persistence path from the new config and
         // migrate the cursor file when the path changed.
-        let new_cursor_file = new_cfg.cursor_file.clone().map(PathBuf::from);
+        let new_cursor_file = new_cfg.state_path().map(PathBuf::from);
         if new_cursor_file != cursor_file {
             match (&cursor_file, &new_cursor_file) {
                 (Some(old), Some(new)) => {
@@ -971,7 +972,7 @@ fn load_start_state(cfg: &AppConfig) -> StateDocument {
 struct CursorPersistence {
     /// Every contract's latest cursor, shared across tasks.
     cursors: Arc<Mutex<HashMap<String, String>>>,
-    /// `None` when `cursor_file` is not configured.
+    /// `None` when neither `state_file` nor `cursor_file` is configured.
     path: Option<PathBuf>,
     /// Issue #278: coalescing writer task that owns the fsync path.
     writer: StateHandle,
@@ -1048,7 +1049,7 @@ pub async fn run_once_with_concurrency(
 ) -> Result<CycleReport> {
     let client = build_poll_client(&cfg)?;
     // Issue #279: fail fast if another instance shares this cursor file.
-    let _state_lock = acquire_state_lock(cfg.cursor_file.as_deref())?;
+    let _state_lock = acquire_state_lock(cfg.state_path())?;
     // Issue #281: load cursors, cooldowns and NoActivity states so a cron run
     // enforces cooldowns across runs and does not re-fire open incidents.
     let loaded = load_state(&cfg);
@@ -4671,5 +4672,41 @@ mod amount_and_cursor_tests {
         let migrated =
             migrate_saved_cursors(saved(&[(other, "9")]), &configured(&[(key.as_str(), ID)]));
         assert_eq!(migrated.get(other).map(String::as_str), Some("9"));
+    }
+}
+
+/// #441: a second `run_with_reload` on the same state file must refuse to
+/// start instead of silently sharing (and overwriting) the state.
+#[cfg(test)]
+mod state_lock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn second_instance_on_the_same_state_file_returns_an_error() {
+        let state = std::env::temp_dir().join(format!(
+            "txwatch_second_instance_{}.json",
+            std::process::id()
+        ));
+        let cfg = AppConfig {
+            state_file: Some(state.display().to_string()),
+            ..AppConfig::default()
+        };
+        let _running = acquire_state_lock(cfg.state_path()).expect("first instance");
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_reload_tx, reload_rx) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_with_reload(cfg, true, shutdown_rx, reload_rx),
+        )
+        .await
+        .expect("a locked state file must fail fast, not start polling");
+        let err = result.expect_err("second instance must not start");
+        assert!(
+            err.downcast_ref::<StateLockHeld>().is_some(),
+            "unexpected error: {err:#}"
+        );
+        drop(_running);
+        let _ = std::fs::remove_file(state_lock_path(state.to_str().unwrap()));
     }
 }

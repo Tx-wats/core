@@ -2586,6 +2586,15 @@ pub struct AppConfig {
     pub contract_files: std::collections::HashMap<String, PathBuf>,
 }
 
+impl AppConfig {
+    /// The file the persisted state document lives in: `state_file`, falling
+    /// back to `cursor_file` (#440). Loading, saving, the writer task and the
+    /// instance lock all go through this one helper so they cannot disagree.
+    pub fn state_path(&self) -> Option<&str> {
+        self.state_file.as_deref().or(self.cursor_file.as_deref())
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {

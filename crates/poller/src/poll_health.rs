@@ -4,11 +4,9 @@
 
 #![allow(dead_code)]
 
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 use tokio::time::MissedTickBehavior;
 
@@ -43,13 +41,18 @@ pub(crate) fn jitter_percent_from_env() -> u64 {
 /// Deterministic per-contract offset in `[0, interval * percent / 100)`,
 /// derived from the contract ID so a contract keeps the same offset across
 /// restarts and reloads. `percent == 0` disables it.
+///
+/// The ID is hashed with SHA-256 (#431): `DefaultHasher`'s algorithm is
+/// unspecified and may change between Rust releases, which would reshuffle
+/// every contract's offset on a toolchain bump.
 pub(crate) fn start_offset(contract_id: &str, interval: Duration, percent: u64) -> Duration {
     if percent == 0 {
         return Duration::ZERO;
     }
-    let mut hasher = DefaultHasher::new();
-    contract_id.hash(&mut hasher);
-    let fraction = (hasher.finish() % 1000) as f64 / 1000.0;
+    let digest = Sha256::digest(contract_id.as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    let fraction = (u64::from_be_bytes(first) % 1000) as f64 / 1000.0;
     interval.mul_f64(percent.min(100) as f64 / 100.0 * fraction)
 }
 
@@ -357,6 +360,32 @@ mod tests {
         assert!(
             distinct.len() > 1,
             "offsets should differ between contracts"
+        );
+    }
+
+    /// #431: pin the offset for known IDs so a toolchain or hasher change that
+    /// would reshuffle every contract's schedule fails this test. Expected
+    /// values are the first 8 bytes of SHA-256(id), big-endian, mod 1000.
+    #[test]
+    fn start_offset_is_pinned_for_known_contract_ids() {
+        let interval = Duration::from_secs(1000);
+        // 100% of a 1000 s interval: the offset in seconds is the fraction * 1000.
+        assert_eq!(
+            start_offset("CONTRACT_A", interval, 100),
+            Duration::from_secs(158)
+        );
+        assert_eq!(
+            start_offset(
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+                interval,
+                100
+            ),
+            Duration::from_secs(324)
+        );
+        // 10% of a 10 s interval for the same ID scales the same fraction.
+        assert_eq!(
+            start_offset("CONTRACT_A", Duration::from_secs(10), 10),
+            Duration::from_millis(158)
         );
     }
 
