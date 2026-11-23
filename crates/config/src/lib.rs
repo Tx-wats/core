@@ -6337,4 +6337,22 @@ mod tests {
         assert_eq!(cfg.concurrency, None);
         assert_eq!(cfg.state_file, None);
     }
+
+    MatchOperator::Exists => {}
+    MatchOperator::Regex => match matcher.value.as_deref() {
+        Some(pat) if !pat.is_empty() => { ... }
+        _ => errors.push(format!("{m_path}.value is required for operator 'regex'")),
+    },
+    MatchOperator::Gt | MatchOperator::Gte | MatchOperator::Lt | MatchOperator::Lte => {
+        match matcher.value.as_deref() {
+            Some(v) if v.trim().parse::<f64>().is_ok() => {}
+            Some(v) => errors.push(format!("{m_path}.value ('{v}') must be numeric ...")),
+            None => errors.push(format!("{m_path}.value is required for comparison operator")),
+        }
+    }
+    MatchOperator::Eq | MatchOperator::Neq | MatchOperator::Contains => {
+        if matcher.value.is_none() {
+            errors.push(format!("{m_path}.value is required"));
+        }
+    }
 }
