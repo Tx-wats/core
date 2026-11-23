@@ -36,7 +36,7 @@ pub use persistence::{
     StateWriter,
 };
 mod poll_health;
-use poll_health::{jitter_percent_from_env, poll_ticker, start_offset, PollHealth};
+use poll_health::{jitter_percent_from_env, jittered, poll_ticker, start_offset, PollHealth};
 
 /// Helper to compute jittered backoff delay for an attempt number.
 pub fn backoff_delay(attempt: u32) -> Duration {
@@ -430,18 +430,18 @@ pub async fn run_with_reload(
         "TxWatch polling engine started"
     );
 
-    let fast_contracts = cfg
-        .contracts
-        .iter()
-        .filter(|c| c.enabled && c.effective_poll_interval(cfg.poll_interval_seconds) < 10)
-        .count();
-    if fast_contracts > 5 {
-        warn!(
-            poll_interval_seconds = cfg.poll_interval_seconds,
-            contracts = fast_contracts,
-            "polling interval is very short with many contracts — Horizon rate limits may apply; \
-             consider poll_interval_seconds >= 10"
-        );
+    // Issue #434: warn per Horizon host on the estimated request rate, naming
+    // the contracts whose own effective interval is short.
+    for load in horizon_poll_load(&cfg) {
+        if load.requests_per_second > HORIZON_RATE_WARN_RPS {
+            warn!(
+                horizon_host = %load.host,
+                estimated_requests_per_second = format!("{:.2}", load.requests_per_second),
+                fast_contracts = %load.fast_contracts.join(", "),
+                "estimated polling rate may exceed Horizon rate limits; \
+                 raise the poll interval of the listed contracts"
+            );
+        }
     }
 
     let counters_for_summary = Arc::clone(&counters);
@@ -1020,6 +1020,10 @@ pub struct CycleReport {
     pub poll_failures: u64,
     /// Webhooks that could not be delivered after all retries.
     pub webhook_failures: u64,
+    /// Transactions skipped because their enrichment failed (#433).
+    pub skipped: u64,
+    /// Rule matches dropped by a cooldown (#433).
+    pub suppressed: u64,
 }
 
 impl CycleReport {
@@ -1100,12 +1104,15 @@ pub async fn run_once_with_concurrency(
                     cursors.insert(key.clone(), cursor.clone());
                 }
                 cooldowns.insert(key.clone(), tracker);
+                let suppressed = state.suppressed;
                 no_activity.insert(key.clone(), state.no_activity_states);
                 match result {
-                    Ok((txs, alerts, webhook_failures, _skipped)) => {
+                    Ok((txs, alerts, webhook_failures, skipped)) => {
                         report.transactions += txs;
                         report.alerts += alerts;
                         report.webhook_failures += webhook_failures;
+                        report.skipped += skipped;
+                        report.suppressed += suppressed;
                     }
                     Err(e) => {
                         log_poll_failure(&contract, 1, &e);
@@ -1130,6 +1137,55 @@ pub async fn run_once_with_concurrency(
 
 /// The Horizon base URL to poll for `contract`: its override when set, else the
 /// network's own instance.
+/// Estimated request rate above which a Horizon host is warned about (#434).
+/// Public Horizon allows roughly 3600 requests per hour per client.
+const HORIZON_RATE_WARN_RPS: f64 = 1.0;
+
+/// Contracts polled more often than this are named in the rate warning.
+const FAST_POLL_SECONDS: u64 = 10;
+
+/// Estimated polling load on one Horizon host (#434).
+#[derive(Debug, Clone, PartialEq)]
+struct HorizonPollLoad {
+    host: String,
+    /// One request per poll per contract (more when a poll pages).
+    requests_per_second: f64,
+    /// Labels of contracts on this host with an effective interval below
+    /// [`FAST_POLL_SECONDS`].
+    fast_contracts: Vec<String>,
+}
+
+/// Group enabled contracts by Horizon host and estimate each host's rate.
+fn horizon_poll_load(cfg: &AppConfig) -> Vec<HorizonPollLoad> {
+    let mut loads: Vec<HorizonPollLoad> = Vec::new();
+    for contract in cfg.contracts.iter().filter(|c| c.enabled) {
+        let base = poll_base_url(contract);
+        let host = reqwest::Url::parse(base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_else(|| base.to_owned());
+        let interval = contract
+            .effective_poll_interval(cfg.poll_interval_seconds)
+            .max(1);
+        let idx = match loads.iter().position(|l| l.host == host) {
+            Some(i) => i,
+            None => {
+                loads.push(HorizonPollLoad {
+                    host,
+                    requests_per_second: 0.0,
+                    fast_contracts: Vec::new(),
+                });
+                loads.len() - 1
+            }
+        };
+        loads[idx].requests_per_second += 1.0 / interval as f64;
+        if interval < FAST_POLL_SECONDS {
+            loads[idx].fast_contracts.push(contract.label.clone());
+        }
+    }
+    loads
+}
+
 pub(crate) fn poll_base_url(contract: &WatchedContract) -> &str {
     contract
         .horizon_base_url_override
@@ -2450,6 +2506,65 @@ async fn horizon_response_error(response: reqwest::Response, url: &str) -> anyho
     )
 }
 
+/// Attempts per operations page before the transaction is evaluated degraded (#435).
+const OPERATION_FETCH_ATTEMPTS: u32 = 3;
+/// First retry delay; doubles per attempt, with jitter.
+const OPERATION_RETRY_BASE: Duration = Duration::from_millis(200);
+/// Longest `Retry-After` honoured for an operations fetch; a longer one gives
+/// up rather than stalling the whole poll cycle.
+const OPERATION_MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
+
+/// GET one operations page, retrying transient failures (#435): connection
+/// errors and 5xx responses back off with jitter, and a 429 waits for its
+/// `Retry-After`. Other client errors and unparsable bodies fail at once.
+async fn fetch_operations_page(client: &Client, url: &str) -> Result<OperationsPage> {
+    let mut attempt = 1;
+    loop {
+        let wait = match client.get(url).send().await {
+            Ok(response) if response.status().is_success() => {
+                return response
+                    .json()
+                    .await
+                    .with_context(|| format!("failed to parse operations from {}", url));
+            }
+            Ok(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                let header = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let (_, applied) = retry_after_delay(header.as_deref(), Utc::now());
+                if attempt >= OPERATION_FETCH_ATTEMPTS || applied > OPERATION_MAX_RETRY_AFTER {
+                    return Err(horizon_response_error(response, url).await);
+                }
+                applied
+            }
+            Ok(response) if response.status().is_server_error() => {
+                if attempt >= OPERATION_FETCH_ATTEMPTS {
+                    return Err(horizon_response_error(response, url).await);
+                }
+                jittered(
+                    OPERATION_RETRY_BASE * 2u32.pow(attempt - 1),
+                    OPERATION_MAX_RETRY_AFTER,
+                )
+            }
+            Ok(response) => return Err(horizon_response_error(response, url).await),
+            Err(e) => {
+                if attempt >= OPERATION_FETCH_ATTEMPTS {
+                    return Err(e).with_context(|| format!("GET {} failed", url));
+                }
+                jittered(
+                    OPERATION_RETRY_BASE * 2u32.pow(attempt - 1),
+                    OPERATION_MAX_RETRY_AFTER,
+                )
+            }
+        };
+        debug!(url = %url, attempt, wait_ms = wait.as_millis() as u64, "retrying operations fetch");
+        tokio::time::sleep(wait).await;
+        attempt += 1;
+    }
+}
+
 /// Fetch all operations for a single transaction from Horizon.
 /// Requests the maximum page size and follows `_links.next` while pages are full.
 #[tracing::instrument(skip(client), fields(tx = %tx_hash))]
@@ -2469,20 +2584,7 @@ async fn fetch_soroban_details(
     let mut ops: Vec<HorizonOperation> = Vec::new();
 
     for _ in 0..MAX_OPERATION_PAGES {
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed", url))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(horizon_response_error(response, &url).await);
-        }
-
-        let page: OperationsPage = response
-            .json()
-            .await
-            .with_context(|| format!("failed to parse operations from {}", url))?;
+        let page = fetch_operations_page(client, &url).await?;
 
         ops.extend(page._embedded.records);
 
@@ -4671,5 +4773,161 @@ mod amount_and_cursor_tests {
         let migrated =
             migrate_saved_cursors(saved(&[(other, "9")]), &configured(&[(key.as_str(), ID)]));
         assert_eq!(migrated.get(other).map(String::as_str), Some("9"));
+    }
+}
+
+/// #434 and #435.
+#[cfg(test)]
+mod poll_rate_and_retry_tests {
+    use super::*;
+    use txwatch_config::Network;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+    fn contract(label: &str, interval: Option<u64>, horizon: Option<&str>) -> WatchedContract {
+        WatchedContract {
+            label: label.into(),
+            contract_id: ID.into(),
+            network: Network::Testnet,
+            rules: vec![],
+            webhook_url: None,
+            webhook_secret: None,
+            poll_interval_seconds: interval,
+            enabled: true,
+            soroban_rpc_url: None,
+            horizon_base_url_override: horizon.map(str::to_owned),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+        }
+    }
+
+    /// #434: the load is estimated per Horizon host from each contract's own
+    /// effective interval, and the fast contracts are named.
+    #[test]
+    fn poll_load_is_grouped_by_host_and_names_fast_contracts() {
+        let mut cfg = AppConfig::default();
+        cfg.poll_interval_seconds = 60;
+        cfg.contracts = vec![
+            contract("fast-a", Some(2), Some("https://horizon.example.com")),
+            contract("fast-b", Some(5), Some("https://horizon.example.com/")),
+            contract("slow", None, Some("https://horizon.example.com")),
+            contract("other", Some(1), Some("https://other.example.com")),
+        ];
+        let loads = horizon_poll_load(&cfg);
+        assert_eq!(loads.len(), 2);
+
+        let main = loads
+            .iter()
+            .find(|l| l.host == "horizon.example.com")
+            .unwrap();
+        assert!((main.requests_per_second - (0.5 + 0.2 + 1.0 / 60.0)).abs() < 1e-9);
+        assert_eq!(main.fast_contracts, vec!["fast-a", "fast-b"]);
+        assert!(main.requests_per_second < HORIZON_RATE_WARN_RPS);
+
+        let other = loads
+            .iter()
+            .find(|l| l.host == "other.example.com")
+            .unwrap();
+        assert!(other.requests_per_second >= HORIZON_RATE_WARN_RPS);
+        assert_eq!(other.fast_contracts, vec!["other"]);
+    }
+
+    #[test]
+    fn disabled_contracts_add_no_load() {
+        let mut cfg = AppConfig::default();
+        let mut off = contract("off", Some(1), None);
+        off.enabled = false;
+        cfg.contracts = vec![off];
+        assert!(horizon_poll_load(&cfg).is_empty());
+    }
+
+    fn empty_ops_page() -> serde_json::Value {
+        serde_json::json!({ "_embedded": { "records": [] } })
+    }
+
+    /// #435: a single transient 502 is retried instead of degrading the
+    /// transaction.
+    #[tokio::test]
+    async fn operations_fetch_retries_a_transient_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_ops_page()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        fetch_soroban_details(&Client::new(), &server.uri(), "abc", ID)
+            .await
+            .expect("a transient 502 must be retried");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// #435: a 429 is retried after its Retry-After.
+    #[tokio::test]
+    async fn operations_fetch_honours_retry_after_on_429() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_ops_page()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        fetch_soroban_details(&Client::new(), &server.uri(), "abc", ID)
+            .await
+            .expect("a 429 with a short Retry-After must be retried");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// #435: persistent failures give up after the attempt budget, and a
+    /// non-transient client error is not retried at all.
+    #[tokio::test]
+    async fn operations_fetch_gives_up_after_three_attempts_and_skips_4xx() {
+        let failing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&failing)
+            .await;
+        assert!(
+            fetch_soroban_details(&Client::new(), &failing.uri(), "abc", ID)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            failing.received_requests().await.unwrap().len(),
+            OPERATION_FETCH_ATTEMPTS as usize
+        );
+
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        assert!(
+            fetch_soroban_details(&Client::new(), &missing.uri(), "abc", ID)
+                .await
+                .is_err()
+        );
+        assert_eq!(missing.received_requests().await.unwrap().len(), 1);
     }
 }
