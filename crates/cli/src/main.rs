@@ -849,7 +849,9 @@ async fn main() -> Result<()> {
             let contract = find_contract_by_label(&cfg, contract)?;
             let client = build_client().context("failed to build HTTP client")?;
 
-            let payloads = txwatch_poller::replay_transaction(&client, &contract, &tx).await?;
+            // #379: single call. Previously the stale three-argument call was
+            // left in place, which (a) didn't compile against the four-argument
+            // signature and (b) would have hit Horizon twice per replay.
             let payloads =
                 txwatch_poller::replay_transaction(&client, &contract, tx, force).await?;
             println!(
@@ -1801,6 +1803,7 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 "matched_files": m.files.len(),
             })
         })
+        .collect();
     // #481: include every effective top-level setting and the loaded files.
     let loaded_files: Vec<String> = cfg
         .loaded_files()

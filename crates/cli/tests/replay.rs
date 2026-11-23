@@ -11,7 +11,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // A valid 64-character hex transaction hash used by the happy-path tests.
 const TX_HASH: &str = "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd";
-const TX_HASH: &str = "replay001";
 const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
 
 fn write_config(name: &str, webhook_url: &str) -> PathBuf {
@@ -250,7 +249,7 @@ async fn replay_contract_lookup_is_case_insensitive() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("1 rule(s) matched transaction replay001"),
+        stdout.contains(&format!("1 rule(s) matched transaction {TX_HASH}")),
         "{stdout}"
     );
 }
@@ -455,6 +454,15 @@ async fn replay_send_routes_to_per_rule_webhook_url() {
         .await
         .expect("failed to run txwatch");
 
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains(&format!("1 rule(s) matched transaction {TX_HASH}")));
+}
+
 #[tokio::test]
 async fn replay_rejects_unrelated_transaction_unless_forced() {
     let horizon = horizon_with_unrelated_transaction().await;
@@ -472,6 +480,69 @@ async fn replay_rejects_unrelated_transaction_unless_forced() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-    assert!(String::from_utf8_lossy(&output.stdout)
-        .contains("1 rule(s) matched transaction replay001"));
+
+// ── #379: replay --force must hit Horizon exactly once ───────────────────────
+
+/// Regression test for #379: `txwatch replay --force` previously called
+/// `replay_transaction` twice — once without `force` (a stale call that no
+/// longer compiled) and once with `force`. If the stale call were "fixed" by
+/// adding the missing argument, Horizon would be hit twice per replay.
+///
+/// This test mounts the transaction-fetch mock with `expect(1)`, so any
+/// regression that re-introduces the double call fails with a clear
+/// "received 2 requests" error rather than silently doubling the load.
+#[tokio::test]
+async fn replay_force_hits_horizon_exactly_once() {
+    let horizon = MockServer::start().await;
+
+    // Exactly one GET for the transaction itself.
+    Mock::given(method("GET"))
+        .and(path(format!("/transactions/{TX_HASH}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "hash":         TX_HASH,
+            "created_at":   "2024-06-01T10:00:00Z",
+            "successful":   true,
+            "paging_token": "900",
+            "fee_charged":  "100"
+        })))
+        .expect(1)
+        .mount(&horizon)
+        .await;
+
+    // Operations are fetched once per replay_transaction call as well.
+    Mock::given(method("GET"))
+        .and(path(format!("/transactions/{TX_HASH}/operations")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [{ "type": "payment" }] }
+        })))
+        .expect(1)
+        .mount(&horizon)
+        .await;
+
+    let config = write_config("force_once", "https://hooks.example.com/unused");
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--horizon-url",
+            &horizon.uri(),
+            "replay",
+            "--contract",
+            "Replay Contract",
+            "--tx",
+            TX_HASH,
+            "--force",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // `MockServer::verify()` (implicit on drop) enforces the `expect(1)` on
+    // both mocks, so a second Horizon call fails this test.
 }
