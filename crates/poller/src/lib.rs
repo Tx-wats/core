@@ -387,7 +387,6 @@ pub async fn run_with_reload(
     #[cfg(feature = "metrics")]
     {
         metrics::set_readiness_policy(cfg.readiness_policy);
-        metrics::register_build_info();
     }
     let summary_every = Duration::from_secs(60);
     let counters = Arc::new(Counters::default());
@@ -1330,7 +1329,7 @@ impl TransactionSource for HorizonSource<'_> {
                 "Horizon returned 429 — rate limited"
             );
             #[cfg(feature = "metrics")]
-            metrics::inc_horizon_rate_limited(contract.network.as_str());
+            metrics::inc_horizon_rate_limited(&contract.label, contract.network.as_str());
             return Ok(FetchOutcome::RateLimited {
                 retry_after: applied_delay,
             });
