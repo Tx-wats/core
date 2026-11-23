@@ -29,7 +29,7 @@ use txwatch_rules::{
 pub mod db_snapshot;
 pub use db_snapshot::{PostgresSnapshotRoutine, SnapshotMetadata};
 pub mod event_stream;
-pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
+pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent};
 pub mod persistence;
 pub use persistence::{
     acquire_state_lock, load_state, save_state, spawn_state_writer, StateDocument, StateHandle,
