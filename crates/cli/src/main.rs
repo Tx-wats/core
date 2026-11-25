@@ -107,7 +107,8 @@ impl NetworkArg {
 enum Command {
     /// Start the polling engine (watches all contracts in the config)
     ///
-    /// With --once, exit codes: 0 = every poll and webhook delivery succeeded, 1 = otherwise
+    /// With --once, exit codes: 0 = every poll and webhook delivery succeeded (and, with
+    /// --fail-on-skipped, no transaction was skipped), 1 = otherwise
     Watch {
         /// Do not actually send webhooks; only log matched rules
         #[arg(long)]
@@ -120,6 +121,11 @@ enum Command {
         /// Run a single poll cycle, deliver alerts, save cursors and exit
         #[arg(long)]
         once: bool,
+
+        /// With --once, also exit non-zero when any transaction was skipped
+        /// because its enrichment failed (strict CI usage)
+        #[arg(long, requires = "once")]
+        fail_on_skipped: bool,
 
         /// Reload configuration when the config file or included files change
         #[arg(long, env = "TXWATCH_WATCH_CONFIG")]
@@ -1055,6 +1061,7 @@ async fn main() -> Result<()> {
         Command::Watch {
             dry_run,
             once,
+            fail_on_skipped,
             watch_config,
             concurrency,
             #[cfg(feature = "metrics")]
@@ -1083,6 +1090,8 @@ async fn main() -> Result<()> {
                     alerts = report.alerts,
                     poll_failures = report.poll_failures,
                     webhook_failures = report.webhook_failures,
+                    skipped = report.skipped,
+                    suppressed = report.suppressed,
                     "poll cycle finished"
                 );
                 if !report.is_success() {
@@ -1090,6 +1099,14 @@ async fn main() -> Result<()> {
                         "poll cycle had {} failed contract poll(s) and {} failed webhook delivery(ies)",
                         report.poll_failures,
                         report.webhook_failures
+                    ));
+                }
+                // #433: a run whose transactions all failed enrichment must not
+                // look clean to strict CI.
+                if fail_on_skipped && report.skipped > 0 {
+                    return Err(anyhow::anyhow!(
+                        "poll cycle skipped {} transaction(s) whose enrichment failed (--fail-on-skipped)",
+                        report.skipped
                     ));
                 }
                 return Ok(());
