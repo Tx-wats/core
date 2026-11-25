@@ -29,7 +29,7 @@ use txwatch_rules::{
 pub mod db_snapshot;
 pub use db_snapshot::{PostgresSnapshotRoutine, SnapshotMetadata};
 pub mod event_stream;
-pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
+pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent};
 pub mod persistence;
 pub use persistence::{
     acquire_state_lock, load_state, save_state, spawn_state_writer, state_lock_path, state_path,
@@ -398,7 +398,6 @@ pub async fn run_with_reload(
     #[cfg(feature = "metrics")]
     {
         metrics::set_readiness_policy(cfg.readiness_policy);
-        metrics::register_build_info();
     }
     let summary_every = Duration::from_secs(60);
     let counters = Arc::new(Counters::default());
@@ -1482,7 +1481,7 @@ impl TransactionSource for HorizonSource<'_> {
                 "Horizon returned 429 — rate limited"
             );
             #[cfg(feature = "metrics")]
-            metrics::inc_horizon_rate_limited(contract.network.as_str());
+            metrics::inc_horizon_rate_limited(&contract.label, contract.network.as_str());
             return Ok(FetchOutcome::RateLimited {
                 retry_after: applied_delay,
             });
