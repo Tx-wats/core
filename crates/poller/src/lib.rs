@@ -15,7 +15,7 @@ use serde::Deserialize;
 #[cfg(test)]
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -32,8 +32,8 @@ pub mod event_stream;
 pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
 pub mod persistence;
 pub use persistence::{
-    acquire_state_lock, load_state, save_state, spawn_state_writer, write_state_blocking,
-    StateDocument, StateHandle, StateWriter,
+    acquire_state_lock, load_state, save_state, spawn_state_writer, state_path,
+    write_state_blocking, StateDocument, StateHandle, StateWriter,
 };
 mod poll_health;
 use poll_health::{jitter_percent_from_env, poll_ticker, start_offset, PollHealth};
@@ -367,14 +367,24 @@ pub async fn run_with_reload(
     // Issue #375: this is the single source of truth for start-up state.
     let loaded = load_start_state(&cfg);
     // Shared so each contract's task can persist the whole cursor map after a
-    // cycle that advanced its own cursor.
+    // cycle that advanced its own cursor. Legacy contract-ID keys are migrated
+    // and every configured contract gets an entry.
     let cursors = Arc::new(Mutex::new(loaded.cursors.clone()));
-    // Issue #278: a single coalescing writer task owns the fsync path, so no
-    // poll task blocks a worker on synchronous disk I/O.
-    let state_writer = spawn_state_writer(cfg.cursor_file.as_deref());
-    let state_handle = state_writer.handle();
     let cooldown_state = Arc::new(Mutex::new(loaded.cooldowns.clone()));
     let no_activity_state = Arc::new(Mutex::new(loaded.no_activity.clone()));
+    // Issue #278: a single coalescing writer task owns the fsync path, so no
+    // poll task blocks a worker on synchronous disk I/O.
+    // Issue #439: seed it with the loaded document so its first write does not
+    // drop every other contract's cursor.
+    let mut state_writer = spawn_state_writer(
+        state_path(&cfg),
+        StateDocument::from_parts(
+            lock(&cursors).clone(),
+            loaded.cooldowns.clone(),
+            loaded.no_activity.clone(),
+        ),
+    );
+    let mut state_handle = state_writer.handle();
     // Issue #275: per-contract runtime state (cooldowns, poll state, health)
     // lives here, keyed by `cursor_key`, so it survives config reloads instead
     // of being recreated with every generation of polling tasks.
@@ -382,7 +392,7 @@ pub async fn run_with_reload(
         Arc::new(Mutex::new(HashMap::new()));
     // Issue #276: the persistence path is recomputed from the active config
     // each generation rather than captured once here.
-    let mut cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
+    let mut state_file = state_path(&cfg).map(PathBuf::from);
 
     #[cfg(feature = "metrics")]
     {
@@ -494,30 +504,12 @@ pub async fn run_with_reload(
                 contract.network.as_str(),
                 interval.as_secs(),
             );
-            let key = contract.cursor_key();
-            // Issue #275: reuse the runtime state of a contract that is still
-            // configured with the same rules; only reset it when the rules
-            // actually changed (or the contract is new).
-            let state = {
-                let mut states = lock(&runtime_states);
-                match states.get(&key) {
-                    Some(existing) if existing.rules == contract.rules => existing.clone(),
-                    Some(_) => {
-                        info!(
-                            contract = %contract.label,
-                            "rules changed on reload — resetting cooldowns and poll state"
-                        );
-                        let fresh = ContractRuntimeState::new(contract);
-                        states.insert(key.clone(), fresh.clone());
-                        fresh
-                    }
-                    None => {
-                        let fresh = ContractRuntimeState::new(contract);
-                        states.insert(key.clone(), fresh.clone());
-                        fresh
-                    }
-                }
-            };
+            let state = select_runtime_state(
+                &mut lock(&runtime_states),
+                &lock(&cooldown_state),
+                &lock(&no_activity_state),
+                contract,
+            );
             tasks.spawn(poll_contract_forever(
                 client.clone(),
                 contract.clone(),
@@ -528,7 +520,7 @@ pub async fn run_with_reload(
                 stop_rx.clone(),
                 CursorPersistence {
                     cursors: Arc::clone(&cursors),
-                    path: cursor_file.clone(),
+                    path: state_file.clone(),
                     writer: state_handle.clone(),
                     cooldowns: Arc::clone(&cooldown_state),
                     no_activity: Arc::clone(&no_activity_state),
@@ -553,19 +545,18 @@ pub async fn run_with_reload(
                 Err(e) => error!(error = ?e, "contract polling task panicked"),
             }
         }
-        // Issue #5: flush once more on the way out, so a graceful shutdown
-        // persists cursors advanced since the last per-cycle write.
-        // Issue #375: write the whole state document, not a cursor-only map,
-        // so cooldowns and NoActivity state survive the restart as well.
-        let final_state = StateDocument::from_parts(
-            lock(&cursors).clone(),
-            lock(&cooldown_state).clone(),
-            lock(&no_activity_state).clone(),
-        );
-        if let Err(e) = save_state(&cfg, &final_state) {
-            error!(error = %e, "failed to flush state on shutdown");
-        }
-        // Issue #278: drain the coalescing writer so the final state is durable.
+        // Issue #5 / #438: flush once more on the way out, so a graceful
+        // shutdown or reload persists everything advanced since the last
+        // per-cycle write. The full document (cursors, cooldowns and NoActivity
+        // states of every contract) goes through the writer, so it is ordered
+        // after any pending per-cycle update and nothing is dropped.
+        state_handle.replace(full_state_document(
+            &lock(&cursors),
+            &lock(&runtime_states),
+            &cooldown_state,
+            &no_activity_state,
+        ));
+        // Issue #278: wait for the writer so the final state is durable.
         state_handle.flush().await;
 
         let Some(new_cfg) = new_cfg else { break };
@@ -588,25 +579,28 @@ pub async fn run_with_reload(
 
         // Issue #276: recompute the persistence path from the new config and
         // migrate the cursor file when the path changed.
-        let new_cursor_file = new_cfg.cursor_file.clone().map(PathBuf::from);
-        if new_cursor_file != cursor_file {
-            match (&cursor_file, &new_cursor_file) {
+        let new_state_file = state_path(&new_cfg).map(PathBuf::from);
+        if new_state_file != state_file {
+            // The writer owns one path; restart it on the new one, seeded with
+            // the full current state so nothing is lost in the move.
+            let doc = full_state_document(
+                &lock(&cursors),
+                &lock(&runtime_states),
+                &cooldown_state,
+                &no_activity_state,
+            );
+            state_writer.shutdown().await;
+            state_writer = spawn_state_writer(state_path(&new_cfg), doc.clone());
+            state_handle = state_writer.handle();
+            match (&state_file, &new_state_file) {
                 (Some(old), Some(new)) => {
                     warn!(
                         old_path = %old.display(),
                         new_path = %new.display(),
-                        "cursor_file changed on reload — migrating saved cursors"
+                        "cursor_file changed on reload — migrating saved state"
                     );
-                    // Issue #450: migrate the whole state document, not just the
-                    // cursors, so cooldowns and NoActivity state are not dropped.
-                    if let Err(e) = write_migrated_state(
-                        new,
-                        lock(&cursors).clone(),
-                        lock(&cooldown_state).clone(),
-                        lock(&no_activity_state).clone(),
-                    ) {
-                        error!(error = %e, "failed to migrate state to the new cursor_file");
-                    }
+                    state_handle.replace(doc);
+                    state_handle.flush().await;
                 }
                 (Some(old), None) => warn!(
                     old_path = %old.display(),
@@ -618,7 +612,7 @@ pub async fn run_with_reload(
                 ),
                 (None, None) => {}
             }
-            cursor_file = new_cursor_file;
+            state_file = new_state_file;
         }
 
         counters
@@ -699,6 +693,150 @@ impl ContractRuntimeState {
             health: PollHealth::default(),
         }
     }
+
+    /// Fresh runtime state seeded from the persisted state document (issue
+    /// #281), used the first time this process polls the contract.
+    fn restored(
+        contract: &WatchedContract,
+        cooldowns: Option<CooldownTracker>,
+        no_activity: Option<&HashMap<String, NoActivityState>>,
+    ) -> Self {
+        let mut runtime = Self::new(contract);
+        if let Some(cooldowns) = cooldowns {
+            runtime.cooldowns = cooldowns;
+        }
+        if let Some(no_activity) = no_activity {
+            runtime.state.no_activity_states = no_activity_by_index(&contract.rules, no_activity);
+        }
+        runtime
+    }
+}
+
+/// Picks the runtime state a contract's polling task starts from and records
+/// it in `runtime_states` (issues #275, #436):
+/// - Same rules as the previous generation: the in-memory runtime state wins,
+///   since it is always at least as new as the state file.
+/// - Rules changed: reset. Persisted windows belong to the old rules.
+/// - First time this process sees the contract: restore cooldowns and
+///   NoActivity states from the state file (issue #281).
+fn select_runtime_state(
+    runtime_states: &mut HashMap<String, ContractRuntimeState>,
+    persisted_cooldowns: &HashMap<String, CooldownTracker>,
+    persisted_no_activity: &HashMap<String, HashMap<String, NoActivityState>>,
+    contract: &WatchedContract,
+) -> ContractRuntimeState {
+    let key = contract.cursor_key();
+    let selected = match runtime_states.get(&key) {
+        Some(existing) if existing.rules == contract.rules => return existing.clone(),
+        Some(_) => {
+            info!(
+                contract = %contract.label,
+                "rules changed on reload — resetting cooldowns and poll state"
+            );
+            ContractRuntimeState::new(contract)
+        }
+        None => ContractRuntimeState::restored(
+            contract,
+            persisted_cooldowns.get(&key).cloned(),
+            persisted_no_activity.get(&key),
+        ),
+    };
+    runtime_states.insert(key, selected.clone());
+    selected
+}
+
+/// NoActivity states are held per rule index while polling, but persisted
+/// keyed by stable rule identity so a reordered config does not move an open
+/// incident to a different rule.
+fn no_activity_by_rule(
+    rules: &[txwatch_config::RuleConfig],
+    states: &[NoActivityState],
+) -> HashMap<String, NoActivityState> {
+    rules
+        .iter()
+        .zip(states)
+        .map(|(rule, state)| (txwatch_rules::rule_identity(rule), state.clone()))
+        .collect()
+}
+
+/// Inverse of [`no_activity_by_rule`]: one entry per configured rule, in order.
+fn no_activity_by_index(
+    rules: &[txwatch_config::RuleConfig],
+    saved: &HashMap<String, NoActivityState>,
+) -> Vec<NoActivityState> {
+    rules
+        .iter()
+        .map(|rule| {
+            saved
+                .get(&txwatch_rules::rule_identity(rule))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Builds the complete state document from every contract's runtime state.
+///
+/// Contracts that have a runtime state contribute their live cooldowns and
+/// NoActivity states; contracts without one (e.g. removed from the config)
+/// keep whatever was last persisted, so nothing is dropped from disk.
+fn full_state_document(
+    cursors: &HashMap<String, String>,
+    runtime_states: &HashMap<String, ContractRuntimeState>,
+    persisted_cooldowns: &Mutex<HashMap<String, CooldownTracker>>,
+    persisted_no_activity: &Mutex<HashMap<String, HashMap<String, NoActivityState>>>,
+) -> StateDocument {
+    let mut cooldowns = lock(persisted_cooldowns).clone();
+    let mut no_activity = lock(persisted_no_activity).clone();
+    for (key, runtime) in runtime_states {
+        cooldowns.insert(key.clone(), runtime.cooldowns.clone());
+        no_activity.insert(
+            key.clone(),
+            no_activity_by_rule(&runtime.rules, &runtime.state.no_activity_states),
+        );
+    }
+    StateDocument::from_parts(cursors.clone(), cooldowns, no_activity)
+}
+
+/// Records `latest` as `key`'s cursor and, when it advanced, hands the
+/// contract's state to the writer task.
+///
+/// Issue #281: cooldown and NoActivity state are written alongside the cursor
+/// so they survive a restart. Issue #437: they come from the task's live
+/// tracker and poll state, not the map loaded at startup, so a crash keeps
+/// every cooldown window opened since boot.
+fn persist_cursor_advance(
+    persist: &CursorPersistence,
+    rules: &[txwatch_config::RuleConfig],
+    key: &str,
+    latest: &str,
+    cooldowns: &CooldownTracker,
+    state: &ContractPollState,
+    alerting_changed: bool,
+) {
+    if persist.path.is_none() {
+        return;
+    }
+    // Scope the lock so no guard is held across an await.
+    let changed = {
+        let mut guard = lock(&persist.cursors);
+        if guard.get(key).map(String::as_str) == Some(latest) {
+            false
+        } else {
+            guard.insert(key.to_string(), latest.to_string());
+            true
+        }
+    };
+    // Issue #403: an incident or cooldown window may change while the cursor
+    // does not, so persist on either.
+    if changed || alerting_changed {
+        persist.writer.send(persistence::StateUpdate {
+            cursor_key: key.to_string(),
+            cursor: latest.to_string(),
+            cooldowns: cooldowns.clone(),
+            no_activity: no_activity_by_rule(rules, &state.no_activity_states),
+        });
+    }
 }
 
 /// Polls one contract every `interval` until `stop` reports `true`, finishing
@@ -723,22 +861,15 @@ async fn poll_contract_forever(
         .unwrap_or_else(|| "now".to_string());
     let mut cursors = HashMap::from([(key.clone(), cursor)]);
     // Poll state and cooldowns live as long as this contract's task, and are
-    // carried across reloads via `runtime`.
+    // carried across reloads via `runtime`. Issue #436: these bindings are
+    // used as-is; the persisted state file was already applied when the
+    // runtime state was first created (see `ContractRuntimeState::restored`).
     let ContractRuntimeState {
         rules,
         mut state,
         mut cooldowns,
         mut health,
     } = runtime;
-    // Issue #281: restore this contract's NoActivity states from the persisted
-    // document so a restart does not re-fire open incidents.
-    if let Some(saved) = lock(&persist.no_activity).get(&key) {
-        state.no_activity_states = saved.clone();
-    }
-    // Issue #281: restore persisted cooldown windows for this contract.
-    if let Some(saved) = lock(&persist.cooldowns).get(&key) {
-        cooldowns = saved.clone();
-    }
     let lag_threshold = ledger_lag_warn_threshold_from_env();
     // Polls are paced by a fixed-period ticker, so the period stays at
     // `interval` however long a cycle takes. The first poll happens
@@ -807,34 +938,16 @@ async fn poll_contract_forever(
                 // restart does not replay transactions we have already seen.
                 // Issue #278: hand the update to the coalescing writer task
                 // instead of doing synchronous disk I/O on this worker.
-                if persist.path.is_some() {
-                    if let Some(latest) = cursors.get(&key) {
-                        // Scope the lock so no guard is held across an await.
-                        let cursor_changed = {
-                            let mut guard = lock(&persist.cursors);
-                            if guard.get(&key) == Some(latest) {
-                                false
-                            } else {
-                                guard.insert(key.clone(), latest.clone());
-                                true
-                            }
-                        };
-                        if cursor_changed || alerting_changed {
-                            // Issue #281: snapshot cooldown and NoActivity state
-                            // alongside the cursor so it survives a restart.
-                            let cooldowns = lock(&persist.cooldowns)
-                                .get(&key)
-                                .cloned()
-                                .unwrap_or_default();
-                            let no_activity = state.no_activity_states.clone();
-                            persist.writer.send(persistence::StateUpdate {
-                                cursor_key: key.clone(),
-                                cursor: latest.clone(),
-                                cooldowns,
-                                no_activity,
-                            });
-                        }
-                    }
+                if let Some(latest) = cursors.get(&key) {
+                    persist_cursor_advance(
+                        &persist,
+                        &contract.rules,
+                        &key,
+                        latest,
+                        &cooldowns,
+                        &state,
+                        alerting_changed,
+                    );
                 }
             }
             Err(e) => {
@@ -889,7 +1002,10 @@ async fn poll_contract_forever(
     }
     {
         let mut guard = lock(&persist.no_activity);
-        guard.insert(key.clone(), state.no_activity_states.clone());
+        guard.insert(
+            key.clone(),
+            no_activity_by_rule(&contract.rules, &state.no_activity_states),
+        );
     }
 
     let cursor = cursors.remove(&key).unwrap_or_else(|| "now".to_string());
@@ -959,6 +1075,13 @@ fn migrate_saved_cursors(
 fn load_start_state(cfg: &AppConfig) -> StateDocument {
     let mut doc = load_state(cfg);
     let saved = std::mem::take(&mut doc.cursors);
+    doc.cursors = resolve_cursors(cfg, saved);
+    doc
+}
+
+/// Resolve `saved` cursors against `cfg`'s contracts: migrate legacy keys and
+/// give every configured contract an entry (`now` when nothing was saved).
+fn resolve_cursors(cfg: &AppConfig, saved: HashMap<String, String>) -> HashMap<String, String> {
     let configured: Vec<(String, String)> = cfg
         .contracts
         .iter()
@@ -969,8 +1092,7 @@ fn load_start_state(cfg: &AppConfig) -> StateDocument {
     for (key, _) in configured {
         cursors.entry(key).or_insert_with(|| "now".to_string());
     }
-    doc.cursors = cursors;
-    doc
+    cursors
 }
 
 /// Shared cursor state a per-contract task needs to persist the whole cursor
@@ -985,28 +1107,12 @@ struct CursorPersistence {
     /// Issue #281: persisted cooldown windows, keyed by cursor key.
     cooldowns: Arc<Mutex<HashMap<String, CooldownTracker>>>,
     /// Issue #281: persisted NoActivity states, keyed by cursor key.
-    no_activity: Arc<Mutex<HashMap<String, Vec<NoActivityState>>>>,
+    no_activity: Arc<Mutex<HashMap<String, HashMap<String, NoActivityState>>>>,
 }
 
 /// Lock a mutex, recovering the contents if a previous holder panicked.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Write the full state (cursors, cooldowns and NoActivity states) to `path`
-/// atomically (see [`persistence::write_state_blocking`]). Used when a reload
-/// migrates to a new `cursor_file` (issue #450).
-///
-/// Issue #278: this is synchronous and must only be called from a blocking
-/// context.
-fn write_migrated_state(
-    path: &Path,
-    cursors: HashMap<String, String>,
-    cooldowns: HashMap<String, CooldownTracker>,
-    no_activity: HashMap<String, HashMap<String, NoActivityState>>,
-) -> Result<()> {
-    let doc = StateDocument::from_parts(cursors, cooldowns, no_activity);
-    persistence::write_state_blocking(path, &doc)
 }
 
 fn build_poll_client(cfg: &AppConfig) -> Result<Client> {
@@ -4685,32 +4791,410 @@ mod amount_and_cursor_tests {
     }
 }
 
+/// Issues #436–#439: runtime and persisted state must survive reloads,
+/// graceful shutdowns and crashes.
 #[cfg(test)]
-mod migrated_state_tests {
+mod state_persistence_tests {
     use super::*;
+    use txwatch_config::{AlertRule, Network, RuleConfig};
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // Issue #450: migrating to a new cursor_file must carry cooldowns along.
+    const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    const COOLDOWN_SECS: u64 = 3600;
+
+    fn rule_config(rule: AlertRule, cooldown_seconds: Option<u64>) -> RuleConfig {
+        let mut cfg: RuleConfig =
+            serde_json::from_str(r#"{"type":"AnyTransaction"}"#).expect("minimal rule");
+        cfg.rule = rule;
+        cfg.cooldown_seconds = cooldown_seconds;
+        cfg
+    }
+
+    fn contract(rules: Vec<RuleConfig>, horizon: Option<String>) -> WatchedContract {
+        WatchedContract {
+            label: "state".into(),
+            contract_id: CONTRACT_ID.into(),
+            network: Network::Testnet,
+            rules,
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            enabled: true,
+            soroban_rpc_url: None,
+            horizon_base_url_override: horizon,
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+        }
+    }
+
+    fn cooled_contract(horizon: Option<String>) -> WatchedContract {
+        contract(
+            vec![rule_config(AlertRule::AnyTransaction, Some(COOLDOWN_SECS))],
+            horizon,
+        )
+    }
+
+    fn rule_name(contract: &WatchedContract) -> String {
+        contract.rules[0].rule.label()
+    }
+
+    /// Opens a cooldown window for the contract's first rule, as a fired
+    /// alert would.
+    fn start_cooldown(tracker: &mut CooldownTracker, contract: &WatchedContract) {
+        assert_eq!(
+            tracker.check(CONTRACT_ID, &rule_name(contract), COOLDOWN_SECS, Utc::now()),
+            Some(0),
+            "first match must fire and open the window"
+        );
+    }
+
+    /// `true` when a new match of the contract's first rule is suppressed.
+    fn suppresses(tracker: &CooldownTracker, contract: &WatchedContract) -> bool {
+        tracker
+            .clone()
+            .check(CONTRACT_ID, &rule_name(contract), COOLDOWN_SECS, Utc::now())
+            .is_none()
+    }
+
+    fn temp_state_file(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "txwatch_state_{}_{}.json",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    async fn empty_horizon() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "_embedded": { "records": [] } })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn persistence_for(
+        cursors: HashMap<String, String>,
+        path: Option<PathBuf>,
+        writer: StateHandle,
+    ) -> CursorPersistence {
+        CursorPersistence {
+            cursors: Arc::new(Mutex::new(cursors)),
+            path,
+            writer,
+            cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            no_activity: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Issue #436: a cooldown started before SIGHUP must still suppress after
+    /// the reload. The polling task hands back the runtime state it was given
+    /// (it no longer rebinds fresh values), and the reload keeps it.
+    #[tokio::test]
+    async fn cooldown_started_before_reload_still_suppresses_after_it() {
+        let horizon = empty_horizon().await;
+        let contract = cooled_contract(Some(horizon.uri()));
+        let key = contract.cursor_key();
+
+        // Generation 1 starts and a cooldown window opens.
+        let mut runtime_states = HashMap::new();
+        let mut runtime = select_runtime_state(
+            &mut runtime_states,
+            &HashMap::new(),
+            &HashMap::new(),
+            &contract,
+        );
+        start_cooldown(&mut runtime.cooldowns, &contract);
+
+        // SIGHUP: the task finishes its in-flight poll and hands its state back.
+        let (_stop_tx, stop_rx) = watch::channel(true);
+        let persist = persistence_for(
+            HashMap::from([(key.clone(), "now".to_string())]),
+            None,
+            spawn_state_writer(None, StateDocument::default()).handle(),
+        );
+        let (returned_key, _cursor, returned) = poll_contract_forever(
+            Client::new(),
+            contract.clone(),
+            Duration::from_secs(3600),
+            1,
+            true,
+            Arc::new(Counters::default()),
+            stop_rx,
+            persist,
+            runtime,
+        )
+        .await;
+        assert_eq!(returned_key, key);
+        assert!(
+            suppresses(&returned.cooldowns, &contract),
+            "the polling task dropped the cooldown it was handed"
+        );
+        runtime_states.insert(key.clone(), returned);
+
+        // Generation 2 (same rules): the in-memory state wins over the
+        // (empty) persisted maps, so the window is still enforced.
+        let reloaded = select_runtime_state(
+            &mut runtime_states,
+            &HashMap::new(),
+            &HashMap::new(),
+            &contract,
+        );
+        assert!(
+            suppresses(&reloaded.cooldowns, &contract),
+            "cooldown started before the reload no longer suppresses"
+        );
+    }
+
+    /// Issue #436: the explicit precedence rules for persisted vs runtime state.
     #[test]
-    fn write_migrated_state_keeps_cooldowns() {
-        let dir = std::env::temp_dir().join(format!("txwatch-450-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
+    fn runtime_state_precedence_on_start_and_reload() {
+        let contract = cooled_contract(None);
+        let key = contract.cursor_key();
 
-        let cooldown: CooldownTracker = serde_json::from_value(serde_json::json!([
-            [["C1", "rule"], {"last_fired": "2026-01-01T00:00:00Z", "suppressed": 2}]
-        ]))
+        let mut tracker = CooldownTracker::new();
+        start_cooldown(&mut tracker, &contract);
+        let persisted_cooldowns = HashMap::from([(key.clone(), tracker)]);
+        let incident = NoActivityState::Alerting {
+            incident_alert_id: "persisted".into(),
+        };
+        let persisted_no_activity = HashMap::from([(
+            key.clone(),
+            HashMap::from([(
+                txwatch_rules::rule_identity(&contract.rules[0]),
+                incident.clone(),
+            )]),
+        )]);
+
+        // First time this process sees the contract: restored from the file.
+        let mut runtime_states = HashMap::new();
+        let first = select_runtime_state(
+            &mut runtime_states,
+            &persisted_cooldowns,
+            &persisted_no_activity,
+            &contract,
+        );
+        assert!(suppresses(&first.cooldowns, &contract));
+        assert_eq!(
+            first.state.no_activity_states,
+            vec![incident],
+            "NoActivity state not restored from the state file"
+        );
+
+        // Same rules on reload: the in-memory state wins over the file.
+        runtime_states
+            .get_mut(&key)
+            .unwrap()
+            .state
+            .no_activity_states = vec![];
+        let same = select_runtime_state(
+            &mut runtime_states,
+            &persisted_cooldowns,
+            &persisted_no_activity,
+            &contract,
+        );
+        assert!(
+            same.state.no_activity_states.is_empty(),
+            "state file overrode the newer runtime state"
+        );
+
+        // Rules changed: reset, ignoring both runtime and persisted state.
+        let mut changed = contract.clone();
+        changed.rules[0].cooldown_seconds = Some(COOLDOWN_SECS + 1);
+        let reset = select_runtime_state(
+            &mut runtime_states,
+            &persisted_cooldowns,
+            &persisted_no_activity,
+            &changed,
+        );
+        assert!(!suppresses(&reset.cooldowns, &contract));
+        assert!(reset.state.no_activity_states.is_empty());
+    }
+
+    /// Issue #437: a cursor-advance write carries the live cooldown tracker,
+    /// so a crash (no graceful shutdown) keeps windows opened since boot and
+    /// the restarted process still enforces them.
+    #[tokio::test]
+    async fn crash_restart_keeps_cooldown_opened_since_boot() {
+        let path = temp_state_file("crash_cooldown");
+        let contract = cooled_contract(None);
+        let key = contract.cursor_key();
+        let cfg = AppConfig {
+            contracts: vec![contract.clone()],
+            state_file: Some(path.display().to_string()),
+            ..AppConfig::default()
+        };
+
+        // Boot with no saved state: the startup cooldown map is empty.
+        let loaded = load_state(&cfg);
+        let writer = spawn_state_writer(state_path(&cfg), loaded.clone());
+        let handle = writer.handle();
+        let persist = persistence_for(
+            resolve_cursors(&cfg, loaded.cursors.clone()),
+            Some(path.clone()),
+            handle.clone(),
+        );
+
+        // A cooldown opens after boot, then the cursor advances.
+        let mut live = CooldownTracker::new();
+        start_cooldown(&mut live, &contract);
+        persist_cursor_advance(
+            &persist,
+            &key,
+            "12345",
+            &live,
+            &ContractPollState::default(),
+        );
+        handle.flush().await;
+
+        // Crash: the process dies without a graceful shutdown, so only the
+        // per-cycle writes reached disk.
+        drop(persist);
+        drop(handle);
+        std::mem::forget(writer);
+
+        // Restart.
+        let reloaded = load_state(&cfg);
+        assert_eq!(
+            reloaded.cursors.get(&key).map(String::as_str),
+            Some("12345")
+        );
+        let restarted = select_runtime_state(
+            &mut HashMap::new(),
+            &reloaded.cooldowns,
+            &reloaded.no_activity,
+            &contract,
+        );
+        assert!(
+            suppresses(&restarted.cooldowns, &contract),
+            "cooldown opened since boot was not persisted before the crash"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Issue #438: a graceful stop must write the full state document. An
+    /// open NoActivity incident survives two stop/start cycles without being
+    /// re-fired (a re-fire would replace its incident id).
+    #[tokio::test]
+    async fn graceful_stop_keeps_no_activity_incident_and_cooldowns() {
+        let path = temp_state_file("graceful_stop");
+        let horizon = empty_horizon().await;
+        let contract = contract(
+            vec![
+                rule_config(AlertRule::NoActivity { minutes: 1 }, None),
+                rule_config(AlertRule::AnyTransaction, Some(COOLDOWN_SECS)),
+            ],
+            Some(horizon.uri()),
+        );
+        let key = contract.cursor_key();
+        let cooled_rule = contract.rules[1].rule.label();
+
+        let open_incident = HashMap::from([
+            (
+                txwatch_rules::rule_identity(&contract.rules[0]),
+                NoActivityState::Alerting {
+                    incident_alert_id: "incident-1".into(),
+                },
+            ),
+            (
+                txwatch_rules::rule_identity(&contract.rules[1]),
+                NoActivityState::Active,
+            ),
+        ]);
+        let mut cooldowns = CooldownTracker::new();
+        cooldowns.check(CONTRACT_ID, &cooled_rule, COOLDOWN_SECS, Utc::now());
+        persistence::write_state_blocking(
+            &path,
+            &StateDocument::from_parts(
+                HashMap::from([(key.clone(), "now".to_string())]),
+                HashMap::from([(key.clone(), cooldowns)]),
+                HashMap::from([(key.clone(), open_incident.clone())]),
+            ),
+        )
         .unwrap();
-        let mut cursors = HashMap::new();
-        cursors.insert("C1".to_string(), "42".to_string());
-        let mut cooldowns = HashMap::new();
-        cooldowns.insert("C1".to_string(), cooldown);
 
-        write_migrated_state(&path, cursors, cooldowns, HashMap::new()).unwrap();
+        let cfg = AppConfig {
+            contracts: vec![contract.clone()],
+            state_file: Some(path.display().to_string()),
+            ..AppConfig::default()
+        };
 
-        let doc: StateDocument =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(doc.cursors.get("C1").map(String::as_str), Some("42"));
-        assert!(doc.cooldowns.contains_key("C1"));
-        let _ = std::fs::remove_dir_all(&dir);
+        for run in 1..=2 {
+            let polled_before = horizon.received_requests().await.unwrap().len();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let handle = tokio::spawn(run_with_shutdown(cfg.clone(), true, shutdown_rx));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while horizon.received_requests().await.unwrap().len() <= polled_before {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "run {run}: Horizon was never polled"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .expect("graceful shutdown")
+                .unwrap()
+                .unwrap();
+
+            let on_disk = load_state(&cfg);
+            assert_eq!(
+                on_disk.no_activity.get(&key),
+                Some(&open_incident),
+                "run {run}: open NoActivity incident lost or re-fired"
+            );
+            let tracker = on_disk
+                .cooldowns
+                .get(&key)
+                .unwrap_or_else(|| panic!("run {run}: cooldowns erased on graceful stop"));
+            assert!(
+                tracker
+                    .clone()
+                    .check(CONTRACT_ID, &cooled_rule, COOLDOWN_SECS, Utc::now())
+                    .is_none(),
+                "run {run}: cooldown window lost on graceful stop"
+            );
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Cursors written by the state writer are read back on the next start:
+    /// the file is a `StateDocument`, not a flat cursor map.
+    #[test]
+    fn load_cursors_reads_the_state_document_format() {
+        let path = temp_state_file("cursor_format");
+        let contract = cooled_contract(None);
+        let key = contract.cursor_key();
+        persistence::write_state_blocking(
+            &path,
+            &StateDocument::from_cursors(HashMap::from([
+                (key.clone(), "777".to_string()),
+                ("mainnet:OTHER".to_string(), "888".to_string()),
+            ])),
+        )
+        .unwrap();
+        let cfg = AppConfig {
+            contracts: vec![contract],
+            cursor_file: Some(path.display().to_string()),
+            ..AppConfig::default()
+        };
+        let cursors = load_start_state(&cfg).cursors;
+        assert_eq!(cursors.get(&key).map(String::as_str), Some("777"));
+        assert_eq!(
+            cursors.get("mainnet:OTHER").map(String::as_str),
+            Some("888")
+        );
+        let _ = fs::remove_file(&path);
     }
 }
