@@ -252,4 +252,194 @@ fn test_attack_memo_rule_invalid_parameters_rejected() {
         result_bad_type.is_err(),
         "Validator must reject an unknown memo_type"
     );
+    // ── Issue #390: DataMatcher rejects unknown / typo'd keys ───────────────────
+
+#[test]
+fn data_matcher_rejects_typo_pointer_key() {
+    // `path` is a typo for `pointer`; before #390 this silently deserialised
+    // with `pointer = ""` (whole-body match) and the rule matched every event.
+    let cid = encode_contract_id(&[70u8; 32]);
+    let bad = format!(
+        r#"
+[network]
+kind = "testnet"
+
+[[contracts]]
+id = "{cid}"
+label = "typo-pointer"
+webhook_url = "https://example.com/hook"
+
+[[contracts.rules]]
+type = "EventEmitted"
+topic = "transfer"
+data = [{{ path = "/amount", op = "gte", value = "100" }}]
+"#
+    );
+    let err = parse_toml_str(&bad).unwrap_err().to_string();
+    assert!(
+        err.contains("unknown field") || err.contains("path"),
+        "expected an unknown-field error mentioning 'path', got: {err}"
+    );
+    assert!(
+        err.contains("pointer"),
+        "error should suggest 'pointer' as the valid key, got: {err}"
+    );
+}
+
+#[test]
+fn data_matcher_rejects_typo_op_key() {
+    let cid = encode_contract_id(&[71u8; 32]);
+    let bad = format!(
+        r#"
+[network]
+kind = "testnet"
+
+[[contracts]]
+id = "{cid}"
+label = "typo-op"
+webhook_url = "https://example.com/hook"
+
+[[contracts.rules]]
+type = "EventEmitted"
+topic = "transfer"
+data = [{{ pointer = "/amount", oper = "gte", value = "100" }}]
+"#
+    );
+    let err = parse_toml_str(&bad).unwrap_err().to_string();
+    assert!(
+        err.contains("unknown field") || err.contains("oper"),
+        "expected an unknown-field error mentioning 'oper', got: {err}"
+    );
+}
+
+#[test]
+fn data_matcher_rejects_typo_value_key() {
+    let cid = encode_contract_id(&[72u8; 32]);
+    let bad = format!(
+        r#"
+[network]
+kind = "testnet"
+
+[[contracts]]
+id = "{cid}"
+label = "typo-value"
+webhook_url = "https://example.com/hook"
+
+[[contracts.rules]]
+type = "EventEmitted"
+topic = "transfer"
+data = [{{ pointer = "/amount", op = "gte", valu = "100" }}]
+"#
+    );
+    let err = parse_toml_str(&bad).unwrap_err().to_string();
+    assert!(
+        err.contains("unknown field") || err.contains("valu"),
+        "expected an unknown-field error mentioning 'valu', got: {err}"
+    );
+}
+
+#[test]
+fn data_matcher_requires_op() {
+    let cid = encode_contract_id(&[73u8; 32]);
+    let bad = format!(
+        r#"
+[network]
+kind = "testnet"
+
+[[contracts]]
+id = "{cid}"
+label = "missing-op"
+webhook_url = "https://example.com/hook"
+
+[[contracts.rules]]
+type = "EventEmitted"
+topic = "transfer"
+data = [{{ pointer = "/amount", value = "100" }}]
+"#
+    );
+    let err = parse_toml_str(&bad).unwrap_err().to_string();
+    assert!(
+        err.contains("missing field") && err.contains("op"),
+        "expected a missing-field error for 'op', got: {err}"
+    );
+}
+
+#[test]
+fn data_matcher_requires_value_for_comparison_operators() {
+    // `value` is optional at the type level (Exists needs no value) but
+    // validation rejects a comparison operator without it.
+    let cid = encode_contract_id(&[74u8; 32]);
+    let bad = format!(
+        r#"
+[network]
+kind = "testnet"
+
+[[contracts]]
+id = "{cid}"
+label = "missing-value"
+webhook_url = "https://example.com/hook"
+
+[[contracts.rules]]
+type = "EventEmitted"
+topic = "transfer"
+data = [{{ pointer = "/amount", op = "gte" }}]
+"#
+    );
+    let err = parse_toml_str(&bad).unwrap_err().to_string();
+    assert!(
+        err.contains("value is required"),
+        "expected 'value is required', got: {err}"
+    );
+}
+
+#[test]
+fn data_matcher_exists_operator_still_needs_no_value() {
+    // Regression guard: deny_unknown_fields / removing serde(default) on `op`
+    // must not break the legitimate `Exists` matcher with no value.
+    let cid = encode_contract_id(&[75u8; 32]);
+    let ok = format!(
+        r#"
+[network]
+kind = "testnet"
+
+[[contracts]]
+id = "{cid}"
+label = "exists"
+webhook_url = "https://example.com/hook"
+
+[[contracts.rules]]
+type = "EventEmitted"
+topic = "transfer"
+data = [{{ pointer = "/amount", op = "exists" }}]
+"#
+    );
+    parse_toml_str(&ok).expect("Exists matcher without a value must validate");
+}
+
+#[test]
+fn data_matcher_rejects_unknown_field_even_with_valid_others() {
+    // A stray extra key alongside otherwise-valid fields must fail.
+    let cid = encode_contract_id(&[76u8; 32]);
+    let bad = format!(
+        r#"
+[network]
+kind = "testnet"
+
+[[contracts]]
+id = "{cid}"
+label = "extra-key"
+webhook_url = "https://example.com/hook"
+
+[[contracts.rules]]
+type = "EventEmitted"
+topic = "transfer"
+data = [{{ pointer = "/amount", op = "gte", value = "100", note = "x" }}]
+"#
+    );
+    let err = parse_toml_str(&bad).unwrap_err().to_string();
+    assert!(
+        err.contains("unknown field") || err.contains("note"),
+        "expected an unknown-field error mentioning 'note', got: {err}"
+    );
+}
 }
