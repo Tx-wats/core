@@ -2,7 +2,10 @@
 //! capped exponential back-off, unhealthy/recovered transitions, and a
 //! deterministic per-contract start offset that spreads polls out in time.
 
-use std::time::{Duration, Instant};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    time::{Duration, Instant},
+};
 
 use sha2::{Digest, Sha256};
 

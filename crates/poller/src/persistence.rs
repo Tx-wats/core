@@ -224,7 +224,7 @@ pub fn write_state_blocking(path: &Path, doc: &StateDocument) -> Result<()> {
     
     temp_file.write_all(raw.as_bytes())
         .with_context(|| format!("failed to write temp state file"))?;
-    temp_file.sync_all()
+    temp_file.as_file().sync_all()
         .with_context(|| format!("failed to fsync temp state file"))?;
     
     temp_file.persist(path)

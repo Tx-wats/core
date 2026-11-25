@@ -29,11 +29,11 @@ pub struct RenderedBody {
     pub content_type: String,
 }
 
-/// Compiled templates, keyed by template source, built once per config
-/// generation. Cloning is cheap (the environments are shared).
+/// Compiled templates, keyed by template source and escape mode, built once
+/// per config generation. Cloning is cheap (the environments are shared).
 #[derive(Debug, Clone, Default)]
 pub struct TemplateCache {
-    compiled: Arc<Mutex<HashMap<String, Arc<minijinja::Environment<'static>>>>>,
+    compiled: Arc<Mutex<HashMap<(String, bool), Arc<minijinja::Environment<'static>>>>>,
 }
 
 impl TemplateCache {
@@ -42,27 +42,45 @@ impl TemplateCache {
         Self::default()
     }
 
-    /// Compiles `template` (if not already cached) and returns the shared
-    /// environment. The environment is configured for strict undefined
-    /// behaviour; auto-escaping is chosen per render.
+    /// Compiles `template` with JSON auto-escaping (if not already cached) and
+    /// returns the shared environment.
     pub fn get(&self, template: &str) -> Result<Arc<minijinja::Environment<'static>>> {
+        self.get_with_escape(template, true)
+    }
+
+    /// Compiles `template` (if not already cached) and returns the shared
+    /// environment. Undefined variables are errors; `json_escape` selects JSON
+    /// auto-escaping, otherwise values are rendered verbatim.
+    pub fn get_with_escape(
+        &self,
+        template: &str,
+        json_escape: bool,
+    ) -> Result<Arc<minijinja::Environment<'static>>> {
+        let key = (template.to_owned(), json_escape);
         if let Some(env) = self
             .compiled
             .lock()
             .map_err(|_| anyhow!("template cache poisoned"))?
-            .get(template)
+            .get(&key)
             .cloned()
         {
             return Ok(env);
         }
         let mut env = minijinja::Environment::new();
         env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        env.set_auto_escape_callback(move |_| {
+            if json_escape {
+                minijinja::AutoEscape::Json
+            } else {
+                minijinja::AutoEscape::None
+            }
+        });
         env.add_template_owned("body", template.to_owned())?;
         let env = Arc::new(env);
         self.compiled
             .lock()
             .map_err(|_| anyhow!("template cache poisoned"))?
-            .insert(template.to_owned(), env.clone());
+            .insert(key, env.clone());
         Ok(env)
     }
 }
@@ -138,43 +156,24 @@ pub fn render_body_with_content_type(
 /// `{"text": {{ label }}}` yields `{"text": "My Contract"}`; for any other
 /// content type values are rendered verbatim. The engine is sandboxed: no file
 /// or network access. The compiled template is looked up in `cache`.
-fn render_template(
-    template: &str,
-    payload: &AlertPayload,
-    content_type: &str,
-    cache: &TemplateCache,
-) -> Result<String> {
-    let env = cache.get(template)?;
-    let json_escape = is_json_content_type(content_type);
-    Ok(env.get_template("body")?.render_with_auto_escape(
-        minijinja::Value::from_serialize(payload),
-        move |_| {
-            if json_escape {
-                minijinja::AutoEscape::Json
-            } else {
-                minijinja::AutoEscape::None
-            }
-        },
-    )?)
-}
-
-/// Renders a user-defined body template. Every [`AlertPayload`] field is a
-/// variable, and values are JSON-escaped, so `{"text": {{ label }}}` yields
-/// `{"text": "My Contract"}`. The engine is sandboxed: no file or network access.
 ///
 /// Optional fields are always present in the render context (as `null` when
 /// the payload omits them), so a template referencing e.g. `{{ source_account }}`
 /// renders for every alert type instead of failing at delivery time for alerts
 /// such as `NoActivity` or cooldown summaries. Unknown variables still fail
 /// (strict undefined behaviour).
-fn render_template(template: &str, payload: &AlertPayload) -> Result<String> {
-    let mut env = minijinja::Environment::new();
-    env.set_auto_escape_callback(|_| minijinja::AutoEscape::Json);
-    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
-    env.add_template("body", template)?;
+fn render_template(
+    template: &str,
+    payload: &AlertPayload,
+    content_type: &str,
+    cache: &TemplateCache,
+) -> Result<String> {
+    let env = cache.get_with_escape(template, is_json_content_type(content_type))?;
     Ok(env
         .get_template("body")?
-        .render(template_context(payload))?)
+        .render(minijinja::Value::from(minijinja::value::Serde(
+            template_context(payload),
+        )))?)
 }
 
 /// Builds the render context for `payload`: the serialized payload with every
@@ -219,7 +218,7 @@ const OPTIONAL_TEMPLATE_FIELDS: &[&str] = &[
 /// delivery time.
 pub fn validate_template(template: &str) -> Result<()> {
     for payload in synthetic_payloads() {
-        render_template(template, &payload).map_err(|err| {
+        render_template(template, &payload, DEFAULT_CONTENT_TYPE, fallback_cache()).map_err(|err| {
             anyhow!(
                 "template failed to render for rule type {}: {}",
                 payload.rule_type,
@@ -255,8 +254,12 @@ fn synthetic_payloads() -> Vec<AlertPayload> {
             transaction_hash: "0".repeat(64),
             function_name: None,
             function_names: vec![],
+            function_args: vec![],
+            observed_count: None,
             amount_xlm: None,
             amount_stroops: None,
+            amount_in_stroops: None,
+            amount_out_stroops: None,
             amount_xlm_decimal: None,
             fee_charged_stroops: None,
             source_account: None,
@@ -281,6 +284,8 @@ fn synthetic_payloads() -> Vec<AlertPayload> {
             enrichment_incomplete: false,
         })
         .collect()
+}
+
 /// Whether `content_type` denotes JSON (ignoring parameters like `charset`).
 fn is_json_content_type(content_type: &str) -> bool {
     let essence = content_type
@@ -1129,16 +1134,6 @@ mod tests {
 
     #[test]
     fn template_renders_optional_fields_as_null() {
-    fn template_requires_a_body() {
-        let err = render_body(WebhookFormat::Template, &fixture(), None, None).unwrap_err();
-        assert!(err.to_string().contains("template"), "got: {}", err);
-    }
-
-    #[test]
-    fn template_body_from_file_like_string_renders() {
-        // Mirrors the CLI flow: the body is read from `--template-file` (or
-        // `--template`) and handed to `render_body` unchanged.
-        let file_contents = "{\n  \"content\": \"{{ rule_triggered }} on {{ label }}\",\n  \"tx\": \"{{ transaction_hash }}\"\n}\n";
         let body = render_body(
             WebhookFormat::Template,
             &fixture(),
@@ -1153,6 +1148,29 @@ mod tests {
     }
 
     #[test]
+    fn template_requires_a_body() {
+        let err = render_body(WebhookFormat::Template, &fixture(), None, None).unwrap_err();
+        assert!(err.to_string().contains("template"), "got: {}", err);
+    }
+
+    #[test]
+    fn template_body_from_file_like_string_renders() {
+        // Mirrors the CLI flow: the body is read from `--template-file` (or
+        // `--template`) and handed to `render_body` unchanged.
+        let file_contents = "{\n  \"content\": \"{{ rule_triggered }} on {{ label }}\",\n  \"tx\": \"{{ transaction_hash }}\"\n}\n";
+        let body = render_body(
+            WebhookFormat::Template,
+            &fixture(),
+            None,
+            Some(file_contents),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["content"], "LargeTransfer(>=10000XLM) on Escrow <main> & co");
+        assert_eq!(v["tx"], "abc123");
+    }
+
+    #[test]
     fn validate_template_accepts_optional_field_references() {
         validate_template(r#"{"text": {{ source_account }}, "memo": {{ memo }}}"#).unwrap();
     }
@@ -1161,12 +1179,6 @@ mod tests {
     fn validate_template_rejects_unknown_variables() {
         let err = validate_template("{{ nope }}").unwrap_err();
         assert!(err.to_string().contains("undefined"), "got: {}", err);
-            Some(file_contents),
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["content"], "LargeTransfer(>=10000XLM) on Escrow <main> & co");
-        assert_eq!(v["tx"], "abc123");
     }
 
     #[test]
@@ -1355,6 +1367,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("10 more alert(s)"));
+    }
+
+    #[test]
     fn discord_enforces_embed_limits() {
         let mut p = fixture();
         p.rule_triggered = "x".repeat(5000);

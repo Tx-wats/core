@@ -579,6 +579,8 @@ fn test_pagerduty_custom_details_snapshot() {
             "custom_details must omit null {key}, got: {sparse_details:?}"
         );
     }
+}
+
 /// Teams Incoming Webhooks / Workflows reject payloads over roughly 28 KB.
 /// A 50-alert digest with long rule labels and long fact values must be
 /// truncated (fact titles/values) and fact-count capped so the rendered body
@@ -613,6 +615,9 @@ fn test_teams_digest_body_stays_under_size_limit() {
         body.len() < TEAMS_LIMIT,
         "Teams body must stay under {TEAMS_LIMIT} bytes, got {}",
         body.len()
+    );
+}
+
 /// Discord enforces a 6000-character total embed budget and at most 25 fields.
 /// An oversized payload (long label, many matched events, many details) must
 /// be trimmed so the resulting embed stays within both limits.

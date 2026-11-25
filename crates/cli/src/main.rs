@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use futures::future::join_all;
 use reqwest::{Client, StatusCode};
@@ -864,7 +864,7 @@ async fn main() -> Result<()> {
             // left in place, which (a) didn't compile against the four-argument
             // signature and (b) would have hit Horizon twice per replay.
             let payloads =
-                txwatch_poller::replay_transaction(&client, &contract, tx, force).await?;
+                txwatch_poller::replay_transaction(&client, &contract, &tx, force).await?;
             println!(
                 "{} rule(s) matched transaction {} for '{}'",
                 payloads.len(),
@@ -890,7 +890,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Cursors { action, force } => {
+        Command::Cursors { ref action, force } => {
             let cfg = load_config(&cli)?;
             let cursor_file = cfg.cursor_file.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("cursor_file is not set in the config; no cursors to manage")
@@ -941,11 +941,11 @@ async fn main() -> Result<()> {
                 }
                 CursorsAction::Set { contract: contract_label, cursor, ledger } => {
                     let contract = cfg.contracts.iter()
-                        .find(|c| c.label == contract_label)
+                        .find(|c| c.label == *contract_label)
                         .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", contract_label))?;
                     let key = txwatch_config::cursor_key(&contract.network, &contract.contract_id);
                     let new_cursor = if let Some(cur) = cursor {
-                        cur
+                        cur.clone()
                     } else if let Some(ledger_seq) = ledger {
                         // Convert ledger sequence to a Horizon TOID paging token: ledger << 32.
                         let client = build_client().context("failed to build HTTP client")?;
@@ -960,14 +960,14 @@ async fn main() -> Result<()> {
                             .context("Horizon root request failed")?
                             .json()
                             .await
-                            .context("failed to parse Horizon root JSON");
+                            .context("failed to parse Horizon root JSON")?;
                         let elder = root["history_elder_ledger"]
                             .as_u64()
                             .ok_or_else(|| anyhow::anyhow!("Horizon root missing history_elder_ledger"))?;
                         let latest = root["history_latest_ledger"]
                             .as_u64()
                             .ok_or_else(|| anyhow::anyhow!("Horizon root missing history_latest_ledger"))?;
-                        if ledger_seq < elder || ledger_seq > latest {
+                        if *ledger_seq < elder || *ledger_seq > latest {
                             return Err(anyhow::anyhow!(
                                 "ledger {} is outside Horizon history range {}..={}",
                                 ledger_seq,
@@ -975,8 +975,7 @@ async fn main() -> Result<()> {
                                 latest
                             ));
                         }
-                        let toid = (ledger_seq as u64) << 32;
-                        toid.to_string()
+                        ledger_to_toid_paging_token(*ledger_seq)
                     } else {
                         return Err(anyhow::anyhow!("--cursor or --ledger is required"));
                     };
@@ -992,7 +991,7 @@ async fn main() -> Result<()> {
                 CursorsAction::Reset { contract: contract_label } => {
                     if let Some(label) = contract_label {
                         let contract = cfg.contracts.iter()
-                            .find(|c| c.label == label)
+                            .find(|c| c.label == *label)
                             .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", label))?;
                         let key = txwatch_config::cursor_key(&contract.network, &contract.contract_id);
                         cursors.remove(&key);
@@ -1605,8 +1604,7 @@ fn spawn_config_watcher(
 fn watched_config_files(path: &Path) -> Vec<PathBuf> {
     let mut files = vec![path.to_path_buf()];
     if let Ok(cfg) = AppConfig::from_file(path) {
-        for included in cfg.loaded_files() {
-            let included = PathBuf::from(included);
+        for included in cfg.loaded_files {
             if !files.contains(&included) {
                 files.push(included);
             }
@@ -1772,12 +1770,14 @@ fn find_contract_by_label(
         })
 }
 
-/// Validate a `--horizon-url` / `--explorer-url` value: it must be an absolute
-/// http(s) URL. Trailing slashes are trimmed so the stored value is canonical.
+/// Horizon paging token (TOID) for the first operation of `ledger`: the
+/// ledger sequence occupies the high 32 bits.
 fn ledger_to_toid_paging_token(ledger: u64) -> String {
-    ((ledger as u64) << 32).to_string()
+    (ledger << 32).to_string()
 }
 
+/// Validate a `--horizon-url` / `--explorer-url` value: it must be an absolute
+/// http(s) URL. Trailing slashes are trimmed so the stored value is canonical.
 fn parse_horizon_url(value: &str) -> Result<String, String> {
     let trimmed = value.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -1808,7 +1808,7 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                         map.insert("enabled".to_string(), serde_json::json!(entry.enabled));
                         map.insert(
                             "severity".to_string(),
-                            serde_json::to_value(entry.severity)
+                            serde_json::to_value(&entry.severity)
                                 .unwrap_or(serde_json::Value::Null),
                         );
                         map.insert(
@@ -1864,9 +1864,9 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
         .collect();
     // #481: include every effective top-level setting and the loaded files.
     let loaded_files: Vec<String> = cfg
-        .loaded_files()
-        .into_iter()
-        .map(str::to_string)
+        .loaded_files
+        .iter()
+        .map(|p| p.display().to_string())
         .collect();
     serde_json::json!({
         "valid": true,
@@ -1945,12 +1945,12 @@ fn webhook_format_names() -> Vec<&'static str> {
         WebhookFormat::Txwatch,
         WebhookFormat::Slack,
         WebhookFormat::Discord,
-        WebhookFormat::PagerDuty,
+        WebhookFormat::Pagerduty,
         WebhookFormat::Teams,
         WebhookFormat::Template,
     ]
     .into_iter()
-    .map(WebhookFormat::as_str)
+    .map(|format| format.as_str())
     .collect()
 }
 
@@ -2054,9 +2054,13 @@ async fn check_webhook(
 ) -> Result<WebhookCheck> {
     let probe = destination_client(client, destination)?;
     if mode == WebhookCheckMode::Post {
-        let payload = serde_json::json!({ "test": true });
-        let result = send_to_destination_simple(&probe, destination, &payload).await?;
-        return Ok(WebhookCheck::from_status(result.final_status));
+        // A real `test: true` alert through the destination's own format,
+        // headers and secret, so the check exercises what delivery will send.
+        let result = txwatch_notifier::send_test_to_destination(&probe, destination, "validate")
+            .await?;
+        let status = StatusCode::from_u16(result.final_status)
+            .context("webhook returned an invalid HTTP status")?;
+        return Ok(WebhookCheck::from_status(status));
     }
 
     let mut request = probe.head(&destination.url);
@@ -2165,9 +2169,11 @@ async fn check_horizon_contract(
         .network
         .soroban_rpc_url()
         .map(str::to_owned)
-        .or_else(|| contract.soroban_rpc_url_override.clone());
+        .or_else(|| contract.soroban_rpc_url.clone());
     let Some(rpc_url) = rpc_url else {
         return HorizonCheck {
+            contract: contract.label.clone(),
+            contract_id: contract.contract_id.clone(),
             network: contract.network.as_str().into(),
             status: "unsupported",
             latest_ledger,
@@ -2283,22 +2289,12 @@ fn contract_instance_ledger_key(contract_id: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Decode a `C…` strkey contract address into its 32 raw bytes. Falls back to
-/// the raw bytes of the string if it is not a valid strkey.
+/// Decode a `C…` strkey contract address (base32, version byte and CRC16
+/// checked) into its 32 raw bytes. Contract IDs are validated at config load,
+/// so an undecodable one yields zeroes and the existence probe reports it as
+/// not found.
 fn strkey_to_raw(contract_id: &str) -> [u8; 32] {
-    use base64::Engine;
-    let mut out = [0u8; 32];
-    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(contract_id) {
-        // 1 version byte + 32 payload bytes + 2 CRC bytes.
-        if decoded.len() == 35 {
-            out.copy_from_slice(&decoded[1..33]);
-            return out;
-        }
-    }
-    let bytes = contract_id.as_bytes();
-    let len = bytes.len().min(32);
-    out[..len].copy_from_slice(&bytes[..len]);
-    out
+    txwatch_config::validate_contract_id(contract_id).unwrap_or([0u8; 32])
 }
 // ── Tracing initialisation ────────────────────────────────────────────────────
 

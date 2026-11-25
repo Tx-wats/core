@@ -208,6 +208,8 @@ impl DestinationClients {
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
     }
+}
+
 /// The `Content-Type` to send for `destination`: its configured
 /// `content_type` (only meaningful for `format = "template"`), or
 /// [`DEFAULT_CONTENT_TYPE`].
@@ -254,12 +256,13 @@ pub async fn send_to_destination_with_client(
     );
     let _enter = span.enter();
 
-    let rendered = format::render_body(
+    let rendered = format::render_body_with_content_type(
         destination.format,
         payload,
         destination.routing_key.as_deref(),
         destination.template.as_deref(),
         destination.content_type.as_deref(),
+        None,
     )?;
     deliver(
         client,
@@ -302,13 +305,13 @@ pub async fn send_to_destination_cached(
     );
     let _enter = span.enter();
 
-    let rendered = format::render_body_cached(
+    let rendered = format::render_body_with_content_type(
         destination.format,
         payload,
         destination.routing_key.as_deref(),
         destination.template.as_deref(),
         destination.content_type.as_deref(),
-        cache,
+        Some(cache),
     )?;
     let client = destination_client(client, destination)?;
     deliver(
@@ -333,6 +336,8 @@ pub async fn send_to_destination_cached_simple(
 ) -> Result<DeliveryResult> {
     let (_tx, rx) = oneshot::channel();
     send_to_destination_cached(client, destination, payload, cache, rx).await
+}
+
 /// Send a real `test: true` payload to `destination` using its own client
 /// (mTLS identity and extra CA certificate) and configured headers/secret.
 ///
@@ -1046,7 +1051,6 @@ mod tests {
 
         let mut dest = destination(
             format!("{}/hook", server.uri()),
-            txwatch_config::WebhookFormat::Tx
             txwatch_config::WebhookFormat::Txwatch,
         );
         dest.headers = WebhookHeaders(

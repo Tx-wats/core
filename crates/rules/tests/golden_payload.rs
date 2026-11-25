@@ -45,6 +45,8 @@ fn golden_payload() -> AlertPayload {
         function_names: vec!["transfer".into()],
         amount_xlm: Some(15000),
         amount_stroops: None,
+        amount_in_stroops: None,
+        amount_out_stroops: None,
         amount_xlm_decimal: None,
         fee_charged_stroops: Some(50000),
         timestamp: 1_705_316_096,

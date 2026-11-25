@@ -1,560 +1,505 @@
-use std::io::Write;
-use tempfile::NamedTempFile;
-use txwatch_config::{
-    encode_account_id, encode_contract_id, load_from_path, parse_toml_str, validate_contract_id,
-    validate_stellar_address, AlertFormat, AlertRule, AlertSeverity, DataMatcher, MatchOperator,
-    RuleCombineMode, TransferDirection,
-};
+use std::path::PathBuf;
+use txwatch_config::AppConfig;
 
-const CONTRACT_HEADER: &str = r#"
-[network]
-kind = "testnet"
+fn project_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate parent missing")
+        .parent()
+        .expect("workspace root missing")
+        .to_path_buf()
+}
 
-[[contracts]]
-id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
-label = "token"
-webhook_url = "https://example.com/hook"
-"#;
+fn crate_fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
 
 #[test]
-fn parses_valid_config_with_all_rule_variants() {
-    let cid = encode_contract_id(&[42u8; 32]);
-    let acct = encode_account_id(&[7u8; 32]);
-    let toml = format!(
-        r#"
-[network]
-kind = "testnet"
-poll_interval_ms = 2000
-page_limit = 50
+fn example_toml_parses_and_validates_successfully() {
+    let path = project_root().join("config").join("example.toml");
+    let cfg =
+        AppConfig::from_file(&path).expect("example.toml should parse and validate successfully");
 
-[server]
-bind = "127.0.0.1:9090"
-metrics_path = "/metrics"
-admin_token = "tok_test"
-
-[storage]
-sqlite_path = "./test.db"
-alert_retention_days = 14
-
-[webhook]
-timeout_ms = 5000
-max_attempts = 3
-initial_backoff_ms = 200
-max_backoff_ms = 2000
-allow_private_ips = true
-
-[[contracts]]
-id = "{cid}"
-label = "soroswap-router"
-webhook_url = "http://127.0.0.1:8888/alerts"
-webhook_secret = "whsec_123"
-webhook_format = "slack"
-start_ledger = 12345
-
-[contracts.tags]
-env = "staging"
-team = "defi"
-
-[[contracts.rules]]
-type = "AnyTransaction"
-cooldown_seconds = 10
-severity = "info"
-
-[[contracts.rules]]
-type = "FailedTransaction"
-severity = "critical"
-
-[[contracts.rules]]
-type = "FunctionCall"
-function = "swap_exact_tokens_for_tokens"
-arg_contains = "USDC"
-
-[[contracts.rules]]
-type = "EventEmitted"
-topic_contains = "swap"
-data_contains = "1000000"
-
-[[contracts.rules]]
-type = "HighFee"
-threshold_stroops = 500000
-
-[[contracts.rules]]
-type = "LargeTransfer"
-threshold_xlm = 250
-asset = "XLM"
-
-[[contracts.rules]]
-type = "SourceAccount"
-account = "{acct}"
-"#
+    assert_eq!(cfg.poll_interval_seconds, 10);
+    assert!(
+        !cfg.contracts.is_empty(),
+        "example config should define contracts"
     );
+}
 
-    let cfg = parse_toml_str(&toml).expect("valid config should parse");
+#[test]
+fn local_toml_parses_and_validates_successfully() {
+    let path = project_root().join("config").join("local.toml");
+    let cfg =
+        AppConfig::from_file(&path).expect("local.toml should parse and validate successfully");
+
+    assert_eq!(cfg.contracts[0].network.as_str(), "custom");
     assert_eq!(
-        cfg.network.resolved_horizon_url(),
-        Some("https://horizon-testnet.stellar.org")
-    );
-    assert_eq!(cfg.contracts.len(), 1);
-    let c = &cfg.contracts[0];
-    assert_eq!(c.rules.len(), 7);
-    assert_eq!(c.webhook_format, AlertFormat::Slack);
-    assert_eq!(c.tags.get("env").map(String::as_str), Some("staging"));
-    assert_eq!(c.rules[1].severity, AlertSeverity::Critical);
-    assert_eq!(
-        c.rules[5].rule.effective_threshold_stroops(),
-        Some(2_500_000_000)
+        cfg.contracts[0].network.horizon_base_url(),
+        "http://stellar:8000"
     );
 }
 
 #[test]
-fn rejects_duplicate_contract_ids_and_labels() {
-    let cid = encode_contract_id(&[5u8; 32]);
-    let toml = format!(
-        r#"
-[network]
-kind = "testnet"
+fn broken_toml_fixture_fails_with_meaningful_error() {
+    let path = crate_fixture_path("broken-example.toml");
+    let err = AppConfig::from_file(&path).expect_err("broken TOML fixture should fail");
+    let msg = err.to_string();
 
-[[contracts]]
-id = "{cid}"
-label = "dup"
-webhook_url = "https://example.com/a"
-
-[[contracts.rules]]
-type = "AnyTransaction"
-
-[[contracts]]
-id = "{cid}"
-label = "dup"
-webhook_url = "https://example.com/b"
-
-[[contracts.rules]]
-type = "AnyTransaction"
-"#
+    assert!(
+        msg.contains("threshold_xlm must be > 0"),
+        "expected a validation failure, got: {}",
+        msg
     );
-    let err = parse_toml_str(&toml).unwrap_err().to_string();
-    assert!(err.contains("duplicates contracts[0]"));
-    assert!(err.contains("labels must be unique"));
 }
 
 #[test]
-fn custom_network_requires_url_and_passphrase() {
-    let cid = encode_contract_id(&[3u8; 32]);
-    let toml = format!(
+fn multi_file_include_with_deterministic_ordering() {
+    let dir = std::env::temp_dir().join(format!("txwatch-test-multi-{}", std::process::id()));
+    let contracts_d = dir.join("contracts.d");
+    std::fs::create_dir_all(&contracts_d).unwrap();
+
+    let root_toml = dir.join("txwatch.toml");
+    std::fs::write(
+        &root_toml,
         r#"
-[network]
-kind = "custom"
-
-[[contracts]]
-id = "{cid}"
-label = "c"
-webhook_url = "https://example.com/a"
-
-[[contracts.rules]]
-type = "AnyTransaction"
-"#
-    );
-    let err = parse_toml_str(&toml).unwrap_err().to_string();
-    assert!(err.contains("network.horizon_url is required"));
-    assert!(err.contains("network.network_passphrase is required"));
-}
-
-#[test]
-fn template_format_requires_template_body() {
-    let cid = encode_contract_id(&[8u8; 32]);
-    let toml = format!(
-        r#"
-[network]
-kind = "testnet"
-
-[[contracts]]
-id = "{cid}"
-label = "c"
-webhook_url = "https://example.com/a"
-webhook_format = "template"
-
-[[contracts.rules]]
-type = "AnyTransaction"
-"#
-    );
-    let err = parse_toml_str(&toml).unwrap_err().to_string();
-    assert!(err.contains("no template string was provided"));
-}
-
-#[test]
-fn loads_from_disk_file() {
-    let cid = encode_contract_id(&[12u8; 32]);
-    let mut tmp = NamedTempFile::new().unwrap();
-    write!(
-        tmp,
-        r#"
-[network]
-kind = "mainnet"
-
-[[contracts]]
-id = "{cid}"
-label = "mainnet-pool"
-webhook_url = "https://hooks.example.org/pool"
-
-[[contracts.rules]]
-type = "FailedTransaction"
-"#
+poll_interval_seconds = 10
+include = ["contracts.d/*.toml"]
+"#,
     )
     .unwrap();
 
-    let cfg = load_from_path(tmp.path()).expect("file should load");
-    assert_eq!(
-        cfg.network.resolved_horizon_url(),
-        Some("https://horizon.stellar.org")
-    );
-}
-
-#[test]
-fn composite_and_not_rules_parse_and_validate() {
-    let cid = encode_contract_id(&[19u8; 32]);
-    let toml = format!(
+    let contract_b = contracts_d.join("02_token.toml");
+    std::fs::write(
+        &contract_b,
         r#"
-[network]
-kind = "testnet"
-
 [[contracts]]
-id = "{cid}"
-label = "amm-router"
-webhook_url = "https://hooks.example.org/amm"
-
-[[contracts.rules]]
-type = "Composite"
-mode = "all"
-severity = "critical"
-
-  [[contracts.rules.rules]]
-  type = "FunctionCall"
-  function = "swap"
-
-  [[contracts.rules.rules]]
-  type = "Not"
-
-    [contracts.rules.rules.rule]
-    type = "FailedTransaction"
-
-[[contracts.rules]]
-type = "RateSpike"
-max_transactions = 25
-window_seconds = 60
-
-[[contracts.rules]]
-type = "Inactivity"
-silence_seconds = 3600
-repeat_interval_seconds = 900
-"#
-    );
-
-    let cfg = parse_toml_str(&toml).expect("composite/rate_spike/inactivity config should parse");
-    let rules = &cfg.contracts[0].rules;
-    assert_eq!(rules.len(), 3);
-    assert_eq!(rules[0].severity, AlertSeverity::Critical);
-    match &rules[0].rule {
-        AlertRule::Composite { mode, rules } => {
-            assert_eq!(*mode, RuleCombineMode::All);
-            assert_eq!(rules.len(), 2);
-            assert!(matches!(rules[1], AlertRule::Not { .. }));
-        }
-        other => panic!("expected Composite rule, got {other:?}"),
-    }
-    assert!(rules[0].rule.label().contains("FunctionCall:swap"));
-    assert!(rules[0].rule.label().contains("!(FailedTransaction)"));
-
-    let empty_composite = format!(
-        r#"
-[network]
-kind = "testnet"
-
-[[contracts]]
-id = "{cid}"
-label = "bad"
-webhook_url = "https://hooks.example.org/amm"
-
-[[contracts.rules]]
-type = "Composite"
-rules = [{{ type = "AnyTransaction" }}]
-"#
-    );
-    let err = parse_toml_str(&empty_composite).unwrap_err().to_string();
-    assert!(err.contains("at least 2 child rules"));
-}
-
-#[test]
-fn multi_webhook_fanout_and_mute_until_validate() {
-    let cid = encode_contract_id(&[27u8; 32]);
-    let toml = format!(
-        r#"
-[network]
-kind = "testnet"
-
-[[contracts]]
-id = "{cid}"
-label = "treasury"
-mute_until = "2099-01-01T00:00:00Z"
-
-[contracts.rate_limit]
-max_alerts = 10
-window_seconds = 60
-
-[[contracts.webhooks]]
-url = "https://hooks.slack.com/services/T000/B000/XXXX"
-format = "slack"
-min_severity = "warning"
-
-[[contracts.webhooks]]
-url = "https://pager.example.org/events"
-format = "json"
-secret = "shhh"
-min_severity = "critical"
-
-[contracts.webhooks.headers]
-X-Routing-Key = "rk_live_123"
-
+label = "Token"
+contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526"
+network = "testnet"
+webhook_url = "https://example.com/b"
 [[contracts.rules]]
 type = "AnyTransaction"
-"#
-    );
+"#,
+    )
+    .unwrap();
 
-    let cfg = parse_toml_str(&toml).expect("multi-webhook config should parse");
-    let c = &cfg.contracts[0];
-    assert!(c.is_muted());
-    let endpoints = c.resolved_webhooks();
-    assert_eq!(endpoints.len(), 2);
-    assert_eq!(endpoints[0].min_severity, Some(AlertSeverity::Warning));
-    assert_eq!(endpoints[1].min_severity, Some(AlertSeverity::Critical));
-    assert_eq!(
-        endpoints[1]
-            .headers
-            .get("X-Routing-Key")
-            .map(String::as_str),
-        Some("rk_live_123")
-    );
-    assert_eq!(c.rate_limit.as_ref().unwrap().max_alerts, 10);
-
-    let bad_mute = format!(
+    let contract_a = contracts_d.join("01_vault.toml");
+    std::fs::write(
+        &contract_a,
         r#"
-[network]
-kind = "testnet"
-
 [[contracts]]
-id = "{cid}"
-label = "bad-mute"
+label = "Vault"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network = "testnet"
+webhook_url = "https://example.com/a"
+[[contracts.rules]]
+type = "AnyTransaction"
+"#,
+    )
+    .unwrap();
+
+    let cfg =
+        AppConfig::from_file(&root_toml).expect("multi-file config should parse and validate");
+    assert_eq!(cfg.contracts.len(), 2);
+    // Deterministic order: 01_vault.toml before 02_token.toml
+    assert_eq!(cfg.contracts[0].label, "Vault");
+    assert_eq!(cfg.contracts[1].label, "Token");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_file_reports_errors_with_originating_file_name() {
+    let dir = std::env::temp_dir().join(format!("txwatch-test-err-{}", std::process::id()));
+    let contracts_d = dir.join("contracts.d");
+    std::fs::create_dir_all(&contracts_d).unwrap();
+
+    let root_toml = dir.join("txwatch.toml");
+    std::fs::write(
+        &root_toml,
+        r#"
+poll_interval_seconds = 10
+include = ["contracts.d/*.toml"]
+"#,
+    )
+    .unwrap();
+
+    let broken_file = contracts_d.join("invalid_contract.toml");
+    std::fs::write(
+        &broken_file,
+        r#"
+[[contracts]]
+label = "Bad"
+contract_id = "CSHORT"
+network = "testnet"
 webhook_url = "https://example.com/hook"
-mute_until = "not-a-timestamp"
-
 [[contracts.rules]]
 type = "AnyTransaction"
-"#
+"#,
+    )
+    .unwrap();
+
+    let err = AppConfig::from_file(&root_toml).expect_err("should fail on invalid contract");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("invalid_contract.toml"),
+        "error must report originating file name, got: {}",
+        err_msg
     );
-    let err = parse_toml_str(&bad_mute).unwrap_err().to_string();
-    assert!(err.contains("RFC-3339"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn large_transfer_direction_parses_and_validates() {
-    let toml = format!(
-        r#"{CONTRACT_HEADER}
-[[contracts.rules]]
-type = "LargeTransfer"
-threshold_xlm = 100
-direction = "in"
-"#
-    );
-    let cfg = parse_toml_str(&toml).expect("valid config");
-    match &cfg.contracts[0].rules[0].rule {
-        AlertRule::LargeTransfer {
-            direction,
-            threshold_xlm,
-            ..
-        } => {
-            assert_eq!(*direction, TransferDirection::In);
-            assert_eq!(*threshold_xlm, Some(100));
-        }
-        other => panic!("unexpected rule: {other:?}"),
-    }
+fn circular_include_is_detected_and_rejected() {
+    let dir = std::env::temp_dir().join(format!("txwatch-test-circular-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let file_a = dir.join("a.toml");
+    let file_b = dir.join("b.toml");
+
+    std::fs::write(
+        &file_a,
+        r#"
+poll_interval_seconds = 10
+include = ["b.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &file_b,
+        r#"
+include = ["a.toml"]
+"#,
+    )
+    .unwrap();
+
+    let err = AppConfig::from_file(&file_a).expect_err("circular include should fail");
+    assert!(err.to_string().contains("circular include detected"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn large_transfer_rejects_unknown_direction() {
-    let toml = format!(
-        r#"{CONTRACT_HEADER}
+fn diamond_include_loads_shared_file_once() {
+    let dir = std::env::temp_dir().join(format!("txwatch-test-diamond-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let file_a = dir.join("a.toml");
+    let file_b = dir.join("b.toml");
+    let file_c = dir.join("c.toml");
+    let shared = dir.join("shared.toml");
+
+    std::fs::write(
+        &file_a,
+        r#"
+poll_interval_seconds = 10
+include = ["b.toml", "c.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &file_b,
+        r#"
+include = ["shared.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &file_c,
+        r#"
+include = ["shared.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &shared,
+        r#"
+[[contracts]]
+label = "Shared"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network = "testnet"
+webhook_url = "https://example.com/shared"
 [[contracts.rules]]
-type = "LargeTransfer"
-threshold_stroops = 1000
-direction = "sideways"
-"#
+type = "AnyTransaction"
+"#,
+    )
+    .unwrap();
+
+    let cfg = AppConfig::from_file(&file_a)
+        .expect("diamond include should not be reported as circular");
+    assert_eq!(
+        cfg.contracts.len(),
+        1,
+        "shared file should be loaded exactly once"
     );
-    assert!(parse_toml_str(&toml).is_err());
+    assert_eq!(cfg.contracts[0].label, "Shared");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn compute_config_hash_detects_changes_in_included_files() {
+    let dir = std::env::temp_dir().join(format!("txwatch-test-hash-{}", std::process::id()));
+    let contracts_d = dir.join("contracts.d");
+    std::fs::create_dir_all(&contracts_d).unwrap();
+
+    let root_toml = dir.join("txwatch.toml");
+    std::fs::write(
+        &root_toml,
+        r#"
+poll_interval_seconds = 10
+include = ["contracts.d/*.toml"]
+"#,
+    )
+    .unwrap();
+
+    let inc_toml = contracts_d.join("token.toml");
+    std::fs::write(&inc_toml, "# version 1\n").unwrap();
+
+    let hash1 = txwatch_config::compute_config_hash(&root_toml).expect("hash1");
+
+    // Modify the included file
+    std::fs::write(&inc_toml, "# version 2\n").unwrap();
+    let hash2 = txwatch_config::compute_config_hash(&root_toml).expect("hash2");
+
+    assert_ne!(hash1, hash2, "hash must change when included file changes");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_syntax_toml_fixture_reports_file_path() {
+    let path = crate_fixture_path("invalid-syntax.toml");
+    let err = AppConfig::from_file(&path).expect_err("invalid TOML fixture should fail");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("invalid-syntax.toml"),
+        "expected the error to include the file path, got: {}",
+        msg
+    );
+}
+
+fn write_temp_config(name: &str, contents: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "txwatch-config-it-{}-{}",
+        std::process::id(),
+        name
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("config.toml");
+    std::fs::write(&path, contents).expect("write temp config");
+    path
+}
+
+const CONTRACT_HEADER: &str = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+name = "token"
+network = "testnet"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+"#;
 
 #[test]
 fn event_emitted_data_matchers_parse_and_validate() {
     let toml = format!(
-        r#"{CONTRACT_HEADER}
+        r#"{header}
 [[contracts.rules]]
-type = "EventEmitted"
-topics = ["transfer", "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7"]
-data_match = [
-  {{ pointer = "/amount", op = "gte", value = "1000" }},
-  {{ pointer = "/memo", op = "regex", value = "^inv-[0-9]+$" }},
-  {{ pointer = "/flag", op = "exists" }},
+type = "event_emitted"
+topic = ["transfer"]
+data = [
+  {{ pointer = "/amount", gte = "1000" }},
+  {{ pointer = "/to", eq = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" }},
 ]
-"#
+"#,
+        header = CONTRACT_HEADER
     );
-    let cfg = parse_toml_str(&toml).expect("valid config");
-    match &cfg.contracts[0].rules[0].rule {
-        AlertRule::EventEmitted {
-            topics, data_match, ..
-        } => {
-            assert_eq!(topics.len(), 2);
-            assert_eq!(data_match.len(), 3);
-            assert_eq!(
-                data_match[0],
-                DataMatcher {
-                    pointer: "/amount".to_string(),
-                    op: MatchOperator::Gte,
-                    value: Some("1000".to_string()),
-                }
-            );
-            assert_eq!(data_match[1].op, MatchOperator::Regex);
-            assert_eq!(data_match[2].op, MatchOperator::Exists);
-        }
-        other => panic!("unexpected rule: {other:?}"),
-    }
+    let path = write_temp_config("data-matchers-ok", &toml);
+    AppConfig::from_file(&path).expect("data matchers should parse and validate");
 }
 
 #[test]
-fn event_emitted_rejects_invalid_data_matcher_regex_and_pointer() {
-    let bad_regex = format!(
-        r#"{CONTRACT_HEADER}
-[[contracts.rules]]
-type = "EventEmitted"
-data_match = [{{ pointer = "/memo", op = "regex", value = "[unclosed" }}]
-"#
-    );
-    assert!(parse_toml_str(&bad_regex).is_err());
-
-    let bad_pointer = format!(
-        r#"{CONTRACT_HEADER}
-[[contracts.rules]]
-type = "EventEmitted"
-data_match = [{{ pointer = "missing_leading_slash", op = "eq", value = "1" }}]
-"#
-    );
-    assert!(parse_toml_str(&bad_pointer).is_err());
-
-    let bad_numeric = format!(
-        r#"{CONTRACT_HEADER}
-[[contracts.rules]]
-type = "EventEmitted"
-data_match = [{{ pointer = "/amount", op = "gt", value = "not-a-number" }}]
-"#
-    );
-    assert!(parse_toml_str(&bad_numeric).is_err());
-}
-
-#[test]
-fn source_account_supports_multiple_accounts_and_muxed_flag() {
+fn event_emitted_typed_topic_patterns_parse() {
     let toml = format!(
-        r#"{CONTRACT_HEADER}
+        r#"{header}
 [[contracts.rules]]
-type = "SourceAccount"
-accounts = [
-  "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",
-  "MAAAAAAAAAAAAAB7BQ2L7E5NBWMXDUCMZSIPOBKRDSBYVLMXGSSKF6YNPIB7Y77ITLVL6",
-]
-match_muxed_base = true
-"#
+type = "event_emitted"
+topic = ["address:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", "u32:5"]
+"#,
+        header = CONTRACT_HEADER
     );
-    let cfg = parse_toml_str(&toml).expect("valid config");
-    match &cfg.contracts[0].rules[0].rule {
-        AlertRule::SourceAccount {
-            accounts,
-            match_muxed_base,
-            ..
-        } => {
-            assert_eq!(accounts.len(), 2);
-            assert!(*match_muxed_base);
-        }
-        other => panic!("unexpected rule: {other:?}"),
+    let path = write_temp_config("typed-topics-ok", &toml);
+    AppConfig::from_file(&path).expect("typed topic patterns should parse");
+}
+
+#[test]
+fn event_emitted_rejects_invalid_json_pointer() {
+    let toml = format!(
+        r#"{header}
+[[contracts.rules]]
+type = "event_emitted"
+topic = ["transfer"]
+data = [{{ pointer = "amount", eq = "1" }}]
+"#,
+        header = CONTRACT_HEADER
+    );
+    let path = write_temp_config("bad-pointer", &toml);
+    let err = AppConfig::from_file(&path).expect_err("invalid pointer should be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("pointer"),
+        "expected pointer validation error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn event_emitted_rejects_incompatible_comparison_type() {
+    let toml = format!(
+        r#"{header}
+[[contracts.rules]]
+type = "event_emitted"
+topic = ["transfer"]
+data = [{{ pointer = "/amount", gte = "not-a-number" }}]
+"#,
+        header = CONTRACT_HEADER
+    );
+    let path = write_temp_config("bad-comparison", &toml);
+    let err = AppConfig::from_file(&path).expect_err("bad comparison should be rejected");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("gte") || msg.contains("comparison") || msg.contains("number"),
+        "expected comparison type validation error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn large_transfer_direction_parses_and_validates() {
+    for direction in ["in", "out", "any"] {
+        let toml = format!(
+            r#"{header}
+[[contracts.rules]]
+type = "large_transfer"
+threshold_xlm = 100.0
+direction = "{direction}"
+"#,
+            header = CONTRACT_HEADER,
+            direction = direction
+        );
+        let path = write_temp_config(&format!("direction-{}", direction), &toml);
+        AppConfig::from_file(&path).expect("valid direction should parse and validate");
+    }
+
+    let toml = format!(
+        r#"{header}
+[[contracts.rules]]
+type = "large_transfer"
+threshold_xlm = 100.0
+direction = "sideways"
+"#,
+        header = CONTRACT_HEADER
+    );
+    let path = write_temp_config("direction-bad", &toml);
+    AppConfig::from_file(&path).expect_err("invalid direction should be rejected");
+}
+
+#[test]
+fn contract_upgraded_rule_parses() {
+    let toml = format!(
+        r#"{header}
+[[contracts.rules]]
+type = "contract_upgraded"
+"#,
+        header = CONTRACT_HEADER
+    );
+    let path = write_temp_config("contract-upgraded", &toml);
+    AppConfig::from_file(&path).expect("contract_upgraded rule should parse");
+}
+
+#[test]
+fn high_fee_validate_is_idempotent() {
+    let toml = format!(
+        r#"{header}
+[[contracts.rules]]
+type = "high_fee"
+threshold_xlm = 1
+"#,
+        header = CONTRACT_HEADER
+    );
+    let path = write_temp_config("high-fee-idempotent", &toml);
+    let mut cfg = AppConfig::from_file(&path).expect("high_fee config should parse and validate");
+
+    // Validating an already-validated rule must succeed.
+    cfg.validate()
+        .expect("re-validating a validated high_fee rule should succeed");
+    cfg.validate()
+        .expect("validating a high_fee rule twice should succeed");
+}
+
+#[test]
+fn high_fee_survives_serialise_and_reparse() {
+    let toml = format!(
+        r#"{header}
+[[contracts.rules]]
+type = "high_fee"
+threshold_xlm = 1
+"#,
+        header = CONTRACT_HEADER
+    );
+    let path = write_temp_config("high-fee-roundtrip", &toml);
+    let cfg = AppConfig::from_file(&path).expect("high_fee config should parse and validate");
+
+    let serialised = toml::to_string(&cfg).expect("serialising a validated config should succeed");
+    let reparsed: AppConfig =
+        toml::from_str(&serialised).expect("re-parsing a serialised config should succeed");
+    reparsed
+        .validate()
+        .expect("re-parsed config should validate successfully");
+}
+
+#[test]
+fn muxed_addresses_from_stellar_docs_are_accepted() {
+    // Real muxed (M...) addresses from the Stellar documentation.
+    let valid = [
+        "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+        "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+    ];
+    for addr in valid {
+        assert_eq!(addr.len(), 69, "muxed address should be 69 chars: {}", addr);
+        txwatch_config::validate_stellar_address(addr)
+            .unwrap_or_else(|e| panic!("valid muxed address {} rejected: {}", addr, e));
     }
 }
 
 #[test]
-fn strkey_validators_accept_valid_and_reject_corrupt() {
-    assert!(validate_contract_id(
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
-    )
-    .is_ok());
-    assert!(validate_contract_id(
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC5"
-    )
-    .is_err());
+fn muxed_address_wrong_length_is_rejected() {
+    // A valid 69-char muxed address padded to 72 chars must be rejected.
+    let padded = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLKAAA";
+    assert_eq!(padded.len(), 72);
+    txwatch_config::validate_stellar_address(padded)
+        .expect_err("wrong-length muxed address should be rejected");
 
-    assert!(validate_stellar_address(
-        "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7"
-    )
-    .is_ok());
-    assert!(validate_stellar_address(
-        "MAAAAAAAAAAAAAB7BQ2L7E5NBWMXDUCMZSIPOBKRDSBYVLMXGSSKF6YNPIB7Y77ITLVL6"
-    )
-    .is_ok());
-    assert!(validate_stellar_address(
-        "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN8"
-    )
-    .is_err());
+    let short = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJL";
+    assert_eq!(short.len(), 68);
+    txwatch_config::validate_stellar_address(short)
+        .expect_err("short muxed address should be rejected");
 }
 
 #[test]
-fn high_fee_rule_parses_both_threshold_units_and_rejects_invalid() {
-    let stroops_toml = format!(
-        r#"{CONTRACT_HEADER}
-[[contracts.rules]]
-type = "HighFee"
-threshold_stroops = 250000
-"#
-    );
-    let cfg = parse_toml_str(&stroops_toml).expect("stroops config");
-    assert_eq!(
-        cfg.contracts[0].rules[0]
-            .rule
-            .effective_threshold_stroops(),
-        Some(250_000)
-    );
-
-    let xlm_toml = format!(
-        r#"{CONTRACT_HEADER}
-[[contracts.rules]]
-type = "HighFee"
-threshold_xlm = 0.5
-"#
-    );
-    let cfg = parse_toml_str(&xlm_toml).expect("xlm config");
-    assert_eq!(
-        cfg.contracts[0].rules[0]
-            .rule
-            .effective_threshold_stroops(),
-        Some(5_000_000)
-    );
-
-    let both_toml = format!(
-        r#"{CONTRACT_HEADER}
-[[contracts.rules]]
-type = "HighFee"
-threshold_stroops = 100
-threshold_xlm = 0.5
-"#
-    );
-    assert!(parse_toml_str(&both_toml).is_err());
-
-    let neither_toml = format!(
-        r#"{CONTRACT_HEADER}
-[[contracts.rules]]
-type = "HighFee"
-"#
-    );
-    assert!(parse_toml_str(&neither_toml).is_err());
+fn muxed_address_bad_checksum_is_rejected() {
+    // Flip the final character of a valid muxed address to break the CRC16 checksum.
+    let bad = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLL";
+    assert_eq!(bad.len(), 69);
+    txwatch_config::validate_stellar_address(bad)
+        .expect_err("muxed address with bad checksum should be rejected");
 }

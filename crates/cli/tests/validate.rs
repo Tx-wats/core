@@ -740,6 +740,8 @@ webhook_url = "https://hooks.example.com/test"
         "expected nested LargeTransfer threshold error in:\n{}",
         stderr
     );
+}
+
 /// #481: `validate --format json` must expose every rule-level setting and all
 /// effective top-level settings so the output can be used to audit what will
 /// actually run. Secrets are reported as `*_set` booleans.
