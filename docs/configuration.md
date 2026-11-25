@@ -851,8 +851,6 @@ severity = "critical"
   "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123...",
   "resolved":            false,
   "matched_events":      [],
-  "old_wasm_hash":       null,
-  "new_wasm_hash":       null,
   "suppressed_count":    0
 }
 ```
@@ -887,7 +885,7 @@ changes before parsing other fields.
 - `function_args` — decoded invocations, as an array of `{ "function_name": "transfer", "args": [{ "index": 0, "value": "G…" }] }` entries (values rendered as text for the decoded `ScVal` types); omitted when the transaction has no decoded invocation parameters.
 - `observed_count` — for `Rate` alerts, the number of matches observed in the sliding window that triggered the alert; omitted for other rules.
 - `matched_events` — for `EventEmitted` alerts, the events that matched, each with `contract_id`, `topics` and `data` (decoded `ScVal` JSON, e.g. `{"symbol": "transfer"}`); empty for other rules.
-- `old_wasm_hash` / `new_wasm_hash` — for `ContractUpgraded` alerts, the contract's WASM hash before and after the upgrade (hex); `null` for other rules.
+- `old_wasm_hash` / `new_wasm_hash` — for `ContractUpgraded` alerts, the contract's WASM hash before and after the upgrade (hex); omitted for other rules.
 - `suppressed_count` — matches of this rule suppressed by its `cooldown_seconds` since the previous alert was sent; `0` otherwise.
 - `test` — present and `true` only on payloads sent by `txwatch test-webhook`, which also use
   `rule_type = "TestWebhook"`, the label exactly as given, and the synthetic but valid contract ID

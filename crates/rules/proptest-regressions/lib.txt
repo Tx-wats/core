@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9db624efb0288465ab54b4c4a84ec2904afd444e60954f6a91c63c421295712f # shrinks to amount_stroops = 8090115130000000, threshold_xlm = 1
+cc 1dd53a63b84674dfd5c1b27a9dee98e6988b8a1a32aed0f09bc5be94218ec03e # shrinks to count = 1, window_secs = 10, attempts = [MatchAttempt { delta_secs: 0, matched: true }, MatchAttempt { delta_secs: 0, matched: true }]
+cc 6c8f1d2f322acb6b247628c08201e8bd3a12481afdaa2cf84ece2b58c13448b6 # shrinks to cooldown_secs = 105, attempts = [MatchAttempt { delta_secs: 0, matched: true }, MatchAttempt { delta_secs: 17, matched: false }, MatchAttempt { delta_secs: 88, matched: true }, MatchAttempt { delta_secs: 0, matched: true }]

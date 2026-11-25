@@ -260,8 +260,12 @@ fn cmp_rendered(value: &Value, pattern: &str) -> bool {
 // or bare to match any scalar's inner text. Non-scalar topics match their
 // compact JSON rendering.
 fn topic_value_matches(value: &Value, pattern: &str) -> bool {
-    // Typed pattern: `type:rest`.
-    if let Some((ty, rest)) = pattern.split_once(':') {
+    // Typed pattern: `type:rest`, where `type` is a bare ScVal type name. A
+    // JSON rendering such as `{"vec":[...]}` also contains ':' but is not one.
+    let typed = pattern.split_once(':').filter(|(ty, _)| {
+        !ty.is_empty() && ty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    if let Some((ty, rest)) = typed {
         if let Value::Object(map) = value {
             if map.len() == 1 {
                 if let Some((k, v)) = map.iter().next() {
@@ -820,6 +824,11 @@ pub fn alert_id(
 ///     rules: vec![RuleConfig {
 ///         rule: AlertRule::AnyTransaction,
 ///         cooldown_seconds: None,
+///         cooldown_summary: false,
+///         enabled: true,
+///         webhook_url: None,
+///         webhook_secret: None,
+///         severity: None,
 ///     }],
 ///     webhook_url: Some("https://hooks.example.com/hook".into()),
 ///     webhook_secret: None,
@@ -1349,6 +1358,19 @@ fn matched_events(rule: &AlertRule, tx: &EnrichedTransaction) -> Vec<ContractEve
             .filter(|e| e.matches(topic, topics, data.as_slice()))
             .cloned()
             .collect(),
+        // #244: a composite reports the events matched by its enabled nested
+        // rules, once each.
+        AlertRule::All { rules } | AlertRule::Any { rules } => {
+            let mut events: Vec<ContractEvent> = Vec::new();
+            for entry in rules.iter().filter(|e| e.enabled) {
+                for event in matched_events(&entry.rule, tx) {
+                    if !events.contains(&event) {
+                        events.push(event);
+                    }
+                }
+            }
+            events
+        }
         _ => Vec::new(),
     }
 }
@@ -2068,6 +2090,20 @@ mod tests {
     use chrono::Datelike;
     use txwatch_config::{AlertRule, RuleEntry, Severity};
 
+    /// What the poller records for a transaction moving `amount` stroops into
+    /// the watched contract (#264): `LargeTransfer` only counts transfers that
+    /// involve that contract.
+    fn inbound_transfer(amount: Option<u64>) -> Vec<ContractTransfer> {
+        amount
+            .map(|amount_stroops| ContractTransfer {
+                from: "GSENDER".into(),
+                to: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
+                amount_stroops,
+            })
+            .into_iter()
+            .collect()
+    }
+
     fn make_tx(
         successful: bool,
         function_names: &[&str],
@@ -2092,7 +2128,7 @@ mod tests {
             operation_count: None,
             watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             events: vec![],
-            contract_transfers: vec![],
+            contract_transfers: inbound_transfer(amount_stroops),
             wasm_upgrade: None,
             enrichment_incomplete: false,
         }
@@ -2270,7 +2306,11 @@ mod tests {
             operation_count: None,
             watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             events: vec![],
-            contract_transfers: vec![],
+            contract_transfers: vec![ContractTransfer {
+                from: "GSENDER".into(),
+                to: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                amount_stroops: 100_000_000_000_000,
+            }],
             wasm_upgrade: None,
             enrichment_incomplete: false,
         };
@@ -3824,7 +3864,16 @@ mod prop_tests {
             operation_count: None,
             watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             events: vec![],
-            contract_transfers: vec![],
+            // LargeTransfer counts only transfers involving the watched
+            // contract (#264), as the poller records them.
+            contract_transfers: amount_stroops
+                .map(|amount_stroops| ContractTransfer {
+                    from: "GSENDER".into(),
+                    to: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                    amount_stroops,
+                })
+                .into_iter()
+                .collect(),
             wasm_upgrade: None,
             enrichment_incomplete: false,
         }
@@ -4396,6 +4445,20 @@ mod suppressor_tests {
 
     // ── Issue #50: EventEmitted ───────────────────────────────────────────────
 
+    /// What the poller records for a transaction moving `amount` stroops into
+    /// the watched contract (#264): `LargeTransfer` only counts transfers that
+    /// involve that contract.
+    fn inbound_transfer(amount: Option<u64>) -> Vec<ContractTransfer> {
+        amount
+            .map(|amount_stroops| ContractTransfer {
+                from: "GSENDER".into(),
+                to: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
+                amount_stroops,
+            })
+            .into_iter()
+            .collect()
+    }
+
     fn make_tx(
         successful: bool,
         function_names: &[&str],
@@ -4419,7 +4482,7 @@ mod suppressor_tests {
             operation_count: None,
             watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             events: vec![],
-            contract_transfers: vec![],
+            contract_transfers: inbound_transfer(amount),
             wasm_upgrade: None,
             enrichment_incomplete: false,
         }
@@ -4609,8 +4672,10 @@ mod suppressor_tests {
         ];
         let rule = |direction: &str| {
             entry(AlertRule::LargeTransfer {
-                threshold_xlm: 1000,
-                threshold_stroops: 10_000_000_000,
+                // 900 XLM, so both the 1,000 XLM inbound and the 900 XLM
+                // outbound leg can fire.
+                threshold_xlm: 900,
+                threshold_stroops: 9_000_000_000,
                 direction: direction.into(),
             })
         };
@@ -4990,7 +5055,7 @@ mod suppressor_tests {
     fn ctx() -> EvalContext<'static> {
         EvalContext {
             label: "Oracle",
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
             network: "testnet",
             network_id: "testnet".into(),
             horizon_base: "https://horizon-testnet.stellar.org",
@@ -5122,20 +5187,38 @@ mod tracker_prop_tests {
         attempts: &[MatchAttempt],
         start: DateTime<Utc>,
     ) -> (Vec<DateTime<Utc>>, u64) {
+        let (fired_at, reported_suppressed, _) =
+            drive_cooldown_with_pending(tracker, cooldown_secs, attempts, start);
+        (fired_at, reported_suppressed)
+    }
+
+    /// [`drive_cooldown`], also returning the matches dropped since the last
+    /// alert: they are still pending and only reported by the next alert.
+    fn drive_cooldown_with_pending(
+        tracker: &mut CooldownTracker,
+        cooldown_secs: u64,
+        attempts: &[MatchAttempt],
+        start: DateTime<Utc>,
+    ) -> (Vec<DateTime<Utc>>, u64, u64) {
         let mut now = start;
         let mut fired_at = Vec::new();
         let mut reported_suppressed = 0u64;
+        let mut pending = 0u64;
         for attempt in attempts {
             now += chrono::TimeDelta::seconds(attempt.delta_secs as i64);
             if !attempt.matched {
                 continue;
             }
-            if let Some(suppressed) = tracker.check("CA", "AnyTransaction", cooldown_secs, now) {
-                reported_suppressed += suppressed;
-                fired_at.push(now);
+            match tracker.check("CA", "AnyTransaction", cooldown_secs, now) {
+                Some(suppressed) => {
+                    reported_suppressed += suppressed;
+                    fired_at.push(now);
+                    pending = 0;
+                }
+                None => pending += 1,
             }
         }
-        (fired_at, reported_suppressed)
+        (fired_at, reported_suppressed, pending)
     }
 
     proptest! {
@@ -5149,8 +5232,8 @@ mod tracker_prop_tests {
         ) {
             let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
             let mut tracker = CooldownTracker::new();
-            let (fired_at, reported_suppressed) =
-                drive_cooldown(&mut tracker, cooldown_secs, &attempts, start);
+            let (fired_at, reported_suppressed, pending) =
+                drive_cooldown_with_pending(&mut tracker, cooldown_secs, &attempts, start);
 
             // Invariant 1: consecutive alerts are at least `cooldown_secs` apart.
             for pair in fired_at.windows(2) {
@@ -5163,11 +5246,13 @@ mod tracker_prop_tests {
                 );
             }
 
-            // Invariant 2: suppressed_count totals equal the dropped matches.
+            // Invariant 2: suppressed_count totals equal the dropped matches,
+            // except those dropped after the last alert, which are still
+            // pending (they are reported by the next alert).
             let total_matches = attempts.iter().filter(|a| a.matched).count() as u64;
             let dropped = total_matches - fired_at.len() as u64;
             prop_assert_eq!(
-                reported_suppressed,
+                reported_suppressed + pending,
                 dropped,
                 "suppressed_count total must equal dropped matches"
             );
@@ -5215,8 +5300,9 @@ mod tracker_prop_tests {
             prop_assert!(fired <= matches / count);
         }
 
-        /// `RateTracker` never fires more than `count` times inside a single
-        /// window, regardless of how the matches are spread over ledger time.
+        /// Every `RateTracker` alert is backed by `count` fresh matches that all
+        /// fall inside one window: matches are never reused across alerts and
+        /// matches older than `window_seconds` never count.
         #[test]
         fn rate_tracker_respects_window(
             count in 1u32..=10u32,
@@ -5226,26 +5312,28 @@ mod tracker_prop_tests {
             let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
             let mut tracker = RateTracker::new();
             let mut now = start;
-            let mut fired_at = Vec::new();
+            // Matches seen since the previous alert, oldest first.
+            let mut since_last: Vec<DateTime<Utc>> = Vec::new();
             for attempt in &attempts {
                 now += chrono::TimeDelta::seconds(attempt.delta_secs as i64);
-                if attempt.matched
-                    && tracker.check("CA", "AnyTransaction", count, window_secs, now)
-                {
-                    fired_at.push(now);
+                if !attempt.matched {
+                    continue;
                 }
-            }
-            // Any `count + 1` consecutive fires must span more than one window.
-            for window in fired_at.windows(count as usize + 1) {
-                let span = (window[count as usize] - window[0]).num_seconds();
-                prop_assert!(
-                    span >= window_secs as i64,
-                    "{} fires within {}s with count {} and window {}s",
-                    count + 1,
-                    span,
-                    count,
-                    window_secs
-                );
+                since_last.push(now);
+                if tracker.check("CA", "AnyTransaction", count, window_secs, now) {
+                    let in_window = since_last
+                        .iter()
+                        .filter(|t| (now - **t).num_seconds() < window_secs as i64)
+                        .count();
+                    prop_assert!(
+                        in_window >= count as usize,
+                        "fired with only {} matches in the last {}s (count {})",
+                        in_window,
+                        window_secs,
+                        count
+                    );
+                    since_last.clear();
+                }
             }
         }
     }

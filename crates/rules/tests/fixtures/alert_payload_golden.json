@@ -1,10 +1,8 @@
 {
   "alert_id": "a3f1bc20e94d77c1a3f1bc20e94d77c1",
-  "amount_in_stroops": null,
-  "amount_out_stroops": null,
   "amount_stroops": null,
   "amount_xlm": 15000,
-  "amount_xlm_decimal": "15000",
+  "amount_xlm_decimal": null,
   "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
   "explorer_link": "https://stellar.expert/explorer/testnet/tx/abc123deadbeef",
   "fee_charged_stroops": 50000,
