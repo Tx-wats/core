@@ -936,9 +936,36 @@ async fn main() -> Result<()> {
                     let new_cursor = if let Some(cur) = cursor {
                         cur
                     } else if let Some(ledger_seq) = ledger {
-                        // Horizon uses paging tokens, but a ledger sequence can be used as a starting point.
-                        // We store it with a prefix so the poller knows to resolve it.
-                        format!("{}", ledger_seq)
+                        // Convert ledger sequence to a Horizon TOID paging token: ledger << 32.
+                        let client = build_client().context("failed to build HTTP client")?;
+                        let horizon_base = contract.network.horizon_base_url();
+                        let root_url = format!("{}/", horizon_base.trim_end_matches('/'));
+                        let root: serde_json::Value = client
+                            .get(&root_url)
+                            .send()
+                            .await
+                            .context("failed to fetch Horizon root")?
+                            .error_for_status()
+                            .context("Horizon root request failed")?
+                            .json()
+                            .await
+                            .context("failed to parse Horizon root JSON");
+                        let elder = root["history_elder_ledger"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("Horizon root missing history_elder_ledger"))?;
+                        let latest = root["history_latest_ledger"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("Horizon root missing history_latest_ledger"))?;
+                        if ledger_seq < elder || ledger_seq > latest {
+                            return Err(anyhow::anyhow!(
+                                "ledger {} is outside Horizon history range {}..={}",
+                                ledger_seq,
+                                elder,
+                                latest
+                            ));
+                        }
+                        let toid = (ledger_seq as u64) << 32;
+                        toid.to_string()
                     } else {
                         return Err(anyhow::anyhow!("--cursor or --ledger is required"));
                     };
@@ -1718,6 +1745,10 @@ fn find_contract_by_label(
 
 /// Validate a `--horizon-url` / `--explorer-url` value: it must be an absolute
 /// http(s) URL. Trailing slashes are trimmed so the stored value is canonical.
+fn ledger_to_toid_paging_token(ledger: u64) -> String {
+    ((ledger as u64) << 32).to_string()
+}
+
 fn parse_horizon_url(value: &str) -> Result<String, String> {
     let trimmed = value.trim().trim_end_matches('/');
     if trimmed.is_empty() {
