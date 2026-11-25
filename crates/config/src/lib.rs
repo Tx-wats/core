@@ -1031,8 +1031,154 @@ pub fn load_from_path(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> 
                 ));
             }
         }
-        if !include_errors.is_empty() {
-            return Err(ConfigError::Validation(include_errors));
+        if self.needs_events() && self.effective_soroban_rpc_url().is_none() {
+            errors.push(format!(
+                "contract '{}': EventEmitted rules need a Soroban RPC endpoint; \
+                 set soroban_rpc_url (network '{}' has no default)",
+                self.label,
+                self.network.as_str()
+            ));
+        }
+
+        errors
+    }
+}
+
+// ── AppConfig ─────────────────────────────────────────────────────────────────
+
+/// Default maximum number of watched contracts in a single configuration.
+/// Every contract is polled by its own task, so an unbounded list could
+/// exhaust memory, file descriptors or the Horizon rate limit. Raise it with
+/// the top-level `max_contracts` setting.
+pub const MAX_CONTRACTS: usize = 100;
+
+/// Upper bound for the `max_contracts` override, for operators running their
+/// own Horizon instance.
+pub const MAX_CONTRACTS_CEILING: usize = 10_000;
+
+/// Default for `max_pages_per_cycle`: the most Horizon pages (200 transactions
+/// each) one poll cycle fetches per contract before yielding. The rest is
+/// picked up from the saved cursor on the next cycle.
+pub const DEFAULT_MAX_PAGES_PER_CYCLE: usize = 10;
+
+/// Upper bound for the `max_pages_per_cycle` override.
+pub const MAX_PAGES_PER_CYCLE_CEILING: usize = 1_000;
+
+/// Key under which a contract's poll cursor is stored, in memory and in
+/// `cursor_file`: `<network>:<contract_id>`. Keying by network as well as
+/// contract ID keeps a contract deployed at the same address on several
+/// networks from sharing one cursor. Keys written before this format existed
+/// are the bare contract ID and contain no `:`.
+pub fn cursor_key(network: &Network, contract_id: &str) -> String {
+    format!("{}:{}", network.cursor_id(), contract_id)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppConfig {
+    /// Default polling interval in seconds for every contract (5–3600).
+    /// Default: 10.
+    #[serde(default = "default_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    /// Per-contract poll start offset jitter, as a percentage of poll_interval_seconds (0–100).
+    /// Spreads contract polls over time to avoid thundering herd. Can be overridden by
+    /// the `TXWATCH_POLL_JITTER_PERCENT` environment variable. Default: 10.
+    #[serde(default = "default_poll_jitter_percent")]
+    pub poll_jitter_percent: u64,
+    #[serde(default)]
+    pub contracts: Vec<WatchedContract>,
+    /// Optional path to a JSON file used to persist the cursor map across restarts.
+    /// When set, the poller will load cursors from this file on startup and write
+    /// the updated cursor map after each poll cycle. If absent, cursors default
+    /// to the Horizon keyword `now` and are not persisted.
+    #[serde(default)]
+    pub cursor_file: Option<String>,
+    /// Maximum number of idle connections per host in the HTTP connection pool.
+    /// Lower values reduce memory usage; higher values improve throughput for many contracts.
+    /// Must be 1–100. Default: 10.
+    #[serde(default = "default_http_pool_max_idle_per_host")]
+    pub http_pool_max_idle_per_host: usize,
+    /// TCP keepalive interval in seconds for idle HTTP connections.
+    /// Helps detect stalled connections quickly; 0 disables keepalive.
+    /// Must be <= 7200. Default: 30 seconds.
+    #[serde(default = "default_http_tcp_keepalive_secs")]
+    pub http_tcp_keepalive_secs: u64,
+    /// Enable verbose output for HTTP connection pool debug information.
+    /// Only useful for troubleshooting connection issues.
+    /// Default: false.
+    #[serde(default)]
+    pub http_connection_verbose: Option<bool>,
+    /// Maximum number of `[[contracts]]` entries (1–10000). Default: 100.
+    /// Raise it only when the Horizon instance (typically your own) can take
+    /// the extra polling load.
+    #[serde(default)]
+    pub max_contracts: Option<usize>,
+    /// Maximum Horizon pages (200 transactions each) fetched per contract in one
+    /// poll cycle (1–1000). When the cap is hit the poller logs a warning and
+    /// continues from the saved cursor on the next cycle. Default: 10.
+    #[serde(default)]
+    pub max_pages_per_cycle: Option<usize>,
+    /// Maximum number of contracts polled concurrently by `watch --once`.
+    /// Must be between 1 and 256. Default: 8.
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+    /// Optional path to a JSON file used to persist state (cursors, cooldowns,
+    /// no-activity tracking) across restarts.
+    #[serde(default)]
+    pub state_file: Option<String>,
+    /// How `/readyz` combines per-contract health: `"all"` (default), `"any"`,
+    /// or a percentage of enabled contracts such as `"80%"`. A contract is
+    /// healthy when it polled successfully within 2 × its effective
+    /// `poll_interval_seconds`.
+    #[serde(default)]
+    pub readiness_policy: ReadinessPolicy,
+    /// Optional list of glob patterns for files to include.
+    /// Loaded in deterministic order (sorted lexicographically).
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// All files that were read to build this configuration (root config + all included files).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub loaded_files: Vec<PathBuf>,
+    /// Every `include` pattern that was expanded (root and nested), with the
+    /// files it matched. Used to report match counts and empty globs (#410).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub include_matches: Vec<IncludeMatch>,
+    /// Map of lowercase contract label to the file where it was defined.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub contract_files: std::collections::HashMap<String, PathBuf>,
+}
+
+impl AppConfig {
+    /// The file the persisted state document lives in: `state_file`, falling
+    /// back to `cursor_file` (#440). Loading, saving, the writer task and the
+    /// instance lock all go through this one helper so they cannot disagree.
+    pub fn state_path(&self) -> Option<&str> {
+        self.state_file.as_deref().or(self.cursor_file.as_deref())
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
+            poll_jitter_percent: default_poll_jitter_percent(),
+            contracts: Vec::new(),
+            cursor_file: None,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
+            http_connection_verbose: None,
+            max_contracts: None,
+            max_pages_per_cycle: None,
+            concurrency: None,
+            state_file: None,
+            include: Vec::new(),
+            loaded_files: Vec::new(),
+            include_matches: Vec::new(),
+            contract_files: std::collections::HashMap::new(),
+            readiness_policy: ReadinessPolicy::default(),
         }
     }
 

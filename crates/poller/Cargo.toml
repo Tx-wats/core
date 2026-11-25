@@ -28,6 +28,7 @@ tokio            = { workspace = true, features = ["rt", "time", "sync", "macros
 anyhow           = { workspace = true }
 tracing          = { workspace = true }
 chrono           = { workspace = true }
+sha2             = { workspace = true }
 futures          = { workspace = true }
 tempfile         = "3.0"
 prometheus       = { version = "0.14", optional = true }
