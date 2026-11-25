@@ -1639,9 +1639,8 @@ fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
     }
 }
 
-/// Remove cursor entries whose `<network>:<contract_id>` key matches no
-/// configured contract. Returns the removed keys. When `dry_run` is set the
-/// file is left untouched.
+/// Remove cursor entries whose cursor key matches no configured contract.
+/// Returns the removed keys. When `dry_run` is set the file is left untouched.
 fn prune_cursors(path: &str, cfg: &AppConfig, dry_run: bool) -> Result<Vec<String>> {
     let path = Path::new(path);
     if !path.exists() {
@@ -1659,7 +1658,7 @@ fn prune_cursors(path: &str, cfg: &AppConfig, dry_run: bool) -> Result<Vec<Strin
     let configured: std::collections::HashSet<String> = cfg
         .contracts
         .iter()
-        .map(|c| format!("{}:{}", c.network.as_str(), c.contract_id))
+        .map(|c| c.cursor_key())
         .collect();
 
     let stale: Vec<String> = cursors
