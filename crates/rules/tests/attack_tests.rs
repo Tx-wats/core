@@ -1,10 +1,8 @@
 //! Attack tests for `txwatch-rules` verifying defenses against numeric overflow,
 //! symbol spoofing, and evasion attacks.
 
-use txwatch_config::{AlertRule, RuleConfig};
-use txwatch_rules::{evaluate, EnrichedTransaction, EvalContext, HorizonTransaction};
 use chrono::{DateTime, Duration, Utc};
-use txwatch_config::{AlertRule, ArgMatcher, DataMatcher, RuleConfig, RuleEntry, TopicMatcher};
+use txwatch_config::{AlertRule, ArgMatcher, DataMatcher, RuleConfig, RuleEntry};
 use txwatch_rules::{
     evaluate, EnrichedTransaction, EvalContext, FunctionInvocation, HorizonTransaction,
     RateTracker,
@@ -55,7 +53,7 @@ fn test_attack_overflow_amount_handled_safely() {
         "an impossible amount must be discarded"
     );
 
-    let rules = vec![RuleConfig {
+    let rules = vec![RuleConfig { enabled: true, webhook_url: None, webhook_secret: None, severity: None,
         rule: AlertRule::LargeTransfer {
             threshold_xlm: 10_000,
             threshold_stroops: 100_000_000_000,
@@ -79,7 +77,7 @@ fn test_attack_case_spoofing_admin_function() {
     let enriched =
         EnrichedTransaction::from_horizon(raw, vec!["Set_Admin".into()], None, None).unwrap();
 
-    let rules = vec![RuleConfig {
+    let rules = vec![RuleConfig { enabled: true, webhook_url: None, webhook_secret: None, severity: None,
         rule: AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into(), "upgrade".into()],
         },
@@ -103,7 +101,7 @@ fn test_admin_function_called_label_preserves_configured_case() {
     let enriched =
         EnrichedTransaction::from_horizon(raw, vec!["setAdmin".into()], None, None).unwrap();
 
-    let rules = vec![RuleConfig {
+    let rules = vec![RuleConfig { enabled: true, webhook_url: None, webhook_secret: None, severity: None,
         rule: AlertRule::AdminFunctionCalled {
             function_names: vec!["setAdmin".into()],
         },
@@ -137,8 +135,8 @@ fn test_source_account_muxed_matches_muxed_entry() {
     raw.source_account_muxed_id = Some("1234".into());
     let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
 
-    let muxed_rules = vec![RuleConfig {
-        rule: AlertRule::SourceAccount {
+    let muxed_rules = vec![RuleConfig { enabled: true, webhook_url: None, webhook_secret: None, severity: None,
+        rule: AlertRule::SourceAccount { mode: txwatch_config::SourceAccountMode::In, field: txwatch_config::SourceAccountField::Source, alert_unless: vec![], allow: vec![], deny: vec![],
             accounts: vec![muxed.into()],
         },
         cooldown_seconds: None,
@@ -150,8 +148,8 @@ fn test_source_account_muxed_matches_muxed_entry() {
         "M… entry must match the muxed source account"
     );
 
-    let base_rules = vec![RuleConfig {
-        rule: AlertRule::SourceAccount {
+    let base_rules = vec![RuleConfig { enabled: true, webhook_url: None, webhook_secret: None, severity: None,
+        rule: AlertRule::SourceAccount { mode: txwatch_config::SourceAccountMode::In, field: txwatch_config::SourceAccountField::Source, alert_unless: vec![], allow: vec![], deny: vec![],
             accounts: vec![base.into()],
         },
         cooldown_seconds: None,
@@ -163,8 +161,8 @@ fn test_source_account_muxed_matches_muxed_entry() {
         "G… entry must match the base source account"
     );
 
-    let other_rules = vec![RuleConfig {
-        rule: AlertRule::SourceAccount {
+    let other_rules = vec![RuleConfig { enabled: true, webhook_url: None, webhook_secret: None, severity: None,
+        rule: AlertRule::SourceAccount { mode: txwatch_config::SourceAccountMode::In, field: txwatch_config::SourceAccountField::Source, alert_unless: vec![], allow: vec![], deny: vec![],
             accounts: vec![
                 "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK"
                     .replace("MA7Q", "MB7Q"),
@@ -185,7 +183,7 @@ fn test_attack_status_spoofing_transaction_failed() {
     let raw = dummy_tx("success_tx", true, None);
     let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
 
-    let rules = vec![RuleConfig {
+    let rules = vec![RuleConfig { enabled: true, webhook_url: None, webhook_secret: None, severity: None,
         rule: AlertRule::TransactionFailed,
         cooldown_seconds: None,
         cooldown_summary: false,
@@ -214,7 +212,7 @@ fn test_attack_contract_upgraded_reports_wasm_hashes() {
         ),
     });
 
-    let rules = vec![RuleConfig {
+    let rules = vec![RuleConfig { enabled: true, webhook_url: None, webhook_secret: None, severity: None,
         rule: AlertRule::ContractUpgraded,
         cooldown_seconds: None,
         cooldown_summary: false,
@@ -238,6 +236,8 @@ fn test_attack_contract_upgraded_reports_wasm_hashes() {
         payloads.is_empty(),
         "ContractUpgraded must not fire without an executable change"
     );
+}
+
 #[test]
 fn test_attack_rule_level_webhook_secret_only_override() {
     // A rule that sets only `webhook_secret` (no `webhook_url`) must still have
@@ -254,7 +254,7 @@ fn test_attack_rule_level_webhook_secret_only_override() {
         severity: None,
         enabled: true,
     }];
-    let ctx = EvalContext {
+    let ctx = EvalContext { network_id: "testnet".to_string(),      
         label: "Escrow",
         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         network: "testnet",
@@ -280,7 +280,7 @@ fn test_attack_rule_level_webhook_secret_only_override() {
 // ── Issue #266: FunctionCalled argument matchers ─────────────────────────────
 
 fn function_called(args: Vec<ArgMatcher>) -> RuleConfig {
-    RuleConfig {
+    RuleConfig { cooldown_summary: false, enabled: true, webhook_url: None, webhook_secret: None, severity: None,
         rule: AlertRule::FunctionCalled {
             function_name: "transfer".into(),
             match_mode: Default::default(),
@@ -385,7 +385,7 @@ fn test_function_called_arg_requires_decoded_invocation() {
 // ── Issue #267: Rate rules ───────────────────────────────────────────────────
 
 fn rate_rule(count: u64, window_seconds: u64) -> Vec<RuleConfig> {
-    vec![RuleConfig {
+    vec![RuleConfig { cooldown_summary: false, enabled: true, webhook_url: None, webhook_secret: None, severity: None,
         rule: AlertRule::Rate {
             rule: Box::new(RuleEntry {
                 enabled: true,
@@ -470,7 +470,7 @@ fn test_rate_rule_per_contract_isolation() {
 // ── Issue #268: Memo rules ───────────────────────────────────────────────────
 
 fn memo_rule(memo_type: Option<&str>, equals: Option<&str>, prefix: Option<&str>) -> Vec<RuleConfig> {
-    vec![RuleConfig {
+    vec![RuleConfig { cooldown_summary: false, enabled: true, webhook_url: None, webhook_secret: None, severity: None,
         rule: AlertRule::Memo {
             memo_type: memo_type.map(Into::into),
             equals: equals.map(Into::into),

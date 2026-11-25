@@ -253,6 +253,8 @@ async fn sigterm_flushes_cursor_and_exits() {
         cursors["testnet:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"],
         "700"
     );
+}
+
 #[tokio::test]
 async fn once_polls_contracts_concurrently() {
     const CONTRACTS: usize = 5;

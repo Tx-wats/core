@@ -1,48 +1,33 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use notifier::alert::{AlertPayload, AlertSeverity};
-use notifier::template::{render_template, TemplateCache};
+//! Renders a template destination body through the compiled-template cache,
+//! as every delivery to a `format = "template"` webhook does.
+use std::hint::black_box;
 
-fn representative_payload() -> AlertPayload {
-    AlertPayload {
-        contract_id: "CABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string(),
-        event_type: "contract_event".to_string(),
-        severity: AlertSeverity::Warning,
-        message: "Contract emitted a warning-level event during batch processing".to_string(),
-        ledger: 123_456,
-        timestamp: 1_700_000_000,
-        fields: [
-            ("batch_size".to_string(), "128".to_string()),
-            ("gas_used".to_string(), "987654".to_string()),
-            ("function".to_string(), "transfer".to_string()),
-        ]
-        .into_iter()
-        .collect(),
-    }
-}
+use criterion::{criterion_group, criterion_main, Criterion};
+use txwatch_config::WebhookFormat;
+use txwatch_notifier::format::{render_body_with_content_type, TemplateCache};
 
-const TEMPLATE_BODY: &str = "\
-[{{ severity }}] Contract {{ contract_id }} at ledger {{ ledger }}
-Event: {{ event_type }}
-Message: {{ message }}
-Batch size: {{ fields.batch_size }}
-Gas used: {{ fields.gas_used }}
-Function: {{ fields.function }}
-";
+const TEMPLATE_BODY: &str = r#"{
+  "text": "[{{ severity }}] {{ rule_triggered }} on {{ label }}",
+  "contract": {{ contract_id }},
+  "tx": {{ transaction_hash }},
+  "ledger": {{ ledger }},
+  "functions": {{ function_names }}
+}"#;
 
 fn bench_render_template(c: &mut Criterion) {
-    let payload = representative_payload();
-    let mut cache = TemplateCache::new();
-    cache
-        .compile("bench-destination", TEMPLATE_BODY)
-        .expect("template should compile");
+    let payload = txwatch_notifier::test_payload("bench");
+    let cache = TemplateCache::new();
 
     let mut group = c.benchmark_group("template_render");
     group.bench_function("cached_destination_body", |b| {
         b.iter(|| {
-            let rendered = render_template(
-                black_box(&cache),
-                black_box("bench-destination"),
+            let rendered = render_body_with_content_type(
+                WebhookFormat::Template,
                 black_box(&payload),
+                None,
+                Some(black_box(TEMPLATE_BODY)),
+                None,
+                Some(&cache),
             )
             .expect("template should render");
             black_box(rendered);

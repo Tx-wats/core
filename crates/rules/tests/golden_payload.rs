@@ -32,7 +32,7 @@ const GOLDEN_PATH: &str = "crates/rules/tests/fixtures/alert_payload_golden.json
 /// `operation_count`) are intentionally left as `None` so they are omitted from
 /// the serialised output — the golden file documents the minimal required shape.
 fn golden_payload() -> AlertPayload {
-    AlertPayload {
+    AlertPayload { function_args: Vec::new(), observed_count: None,
         schema_version: 1,
         alert_id: "a3f1bc20e94d77c1a3f1bc20e94d77c1".into(),
         label: "My Escrow Contract".into(),
@@ -121,8 +121,8 @@ fn alert_payload_golden_file_matches_serialization() {
 #[test]
 fn large_transfer_payload_reports_direction_amount() {
     // Mixed-direction transaction: contract received 1,000 XLM and sent 900 XLM.
-    let amount_in_stroops: i64 = 10_000_000_000; // 1,000 XLM
-    let amount_out_stroops: i64 = 9_000_000_000; // 900 XLM
+    let amount_in_stroops: u64 = 10_000_000_000; // 1,000 XLM
+    let amount_out_stroops: u64 = 9_000_000_000; // 900 XLM
 
     let mut payload = golden_payload();
     payload.rule_type = "LargeTransfer".into();
@@ -139,17 +139,17 @@ fn large_transfer_payload_reports_direction_amount() {
         serde_json::to_value(&payload).expect("AlertPayload should serialize to JSON");
 
     assert_eq!(
-        serialized["amount_stroops"].as_i64(),
+        serialized["amount_stroops"].as_u64(),
         Some(amount_in_stroops),
         "amount_stroops must reflect the inbound amount that fired the rule"
     );
     assert_eq!(
-        serialized["amount_in_stroops"].as_i64(),
+        serialized["amount_in_stroops"].as_u64(),
         Some(amount_in_stroops),
         "amount_in_stroops must report the inbound total"
     );
     assert_eq!(
-        serialized["amount_out_stroops"].as_i64(),
+        serialized["amount_out_stroops"].as_u64(),
         Some(amount_out_stroops),
         "amount_out_stroops must report the outbound total"
     );

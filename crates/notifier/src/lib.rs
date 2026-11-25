@@ -602,7 +602,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_payload() -> AlertPayload {
-        AlertPayload {
+        AlertPayload { function_args: Vec::new(), observed_count: None, amount_in_stroops: None, amount_out_stroops: None,
             schema_version: 1,
             alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "Test Contract".into(),

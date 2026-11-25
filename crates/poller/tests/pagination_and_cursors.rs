@@ -316,6 +316,21 @@ fn operations_page(count: usize, next: &str) -> serde_json::Value {
 
 /// The `cursor` query parameter of every operations request the server saw.
 async fn requested_operation_cursors(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/operations"))
+        .filter_map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "cursor")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn legacy_cursor_file_is_migrated_to_a_versioned_state_document() {
     let server = MockServer::start().await;
@@ -325,6 +340,22 @@ async fn legacy_cursor_file_is_migrated_to_a_versioned_state_document() {
 
     txwatch_poller::run_once(
         config(&contract_toml("legacy", ID, "testnet"), &file, &[&server]),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let state = read_state(&file);
+    assert_eq!(state.get("version").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        state
+            .get("cursors")
+            .and_then(|c| c.get(format!("testnet:{ID}")))
+            .and_then(Value::as_str),
+        Some("501")
+    );
+}
+
 // --- Soroban event stream pagination (issue #289) -------------------------
 //
 // `SorobanEventStreamer` must never send `startLedger` together with a

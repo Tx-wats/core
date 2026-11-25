@@ -411,6 +411,12 @@ pub struct EnrichedTransaction {
     pub source_account: Option<String>,
     /// For fee-bump transactions, the inner source account.
     pub fee_account: Option<String>,
+    /// Muxed (`M…`) form of the source account, when it is muxed (#398).
+    pub source_account_muxed: Option<String>,
+    /// The muxed account id embedded in `source_account_muxed`.
+    pub source_account_muxed_id: Option<String>,
+    /// Muxed (`M…`) form of the fee payer, when it is muxed (#398).
+    pub fee_account_muxed: Option<String>,
     // ── Issue #56: additional metadata fields ─────────────────────────────────
     /// Ledger sequence number in which this transaction was included.
     pub ledger: Option<u32>,
@@ -498,6 +504,9 @@ impl EnrichedTransaction {
             // are deliberately not repeated here.
             source_account: tx.source_account,
             fee_account: tx.fee_account,
+            source_account_muxed: tx.source_account_muxed,
+            source_account_muxed_id: tx.source_account_muxed_id,
+            fee_account_muxed: tx.fee_account_muxed,
             ledger: tx.ledger,
             memo: tx.memo,
             memo_type: tx.memo_type,
@@ -1185,10 +1194,27 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
         } => {
             // `source_account` holds the inner source; `fee_account` holds the
             // fee payer (the fee-bump source for fee-bump transactions).
-            let matched_account = match field {
-                txwatch_config::SourceAccountField::Source => tx.source_account.as_deref(),
-                txwatch_config::SourceAccountField::FeeAccount => {
-                    tx.fee_account.as_deref().or(tx.source_account.as_deref())
+            // #398: `M…` entries are compared with the muxed form, `G…`
+            // entries with the underlying account.
+            let (matched_account, matched_muxed) = match field {
+                txwatch_config::SourceAccountField::Source => (
+                    tx.source_account.as_deref(),
+                    tx.source_account_muxed.as_deref(),
+                ),
+                txwatch_config::SourceAccountField::FeeAccount if tx.fee_account.is_some() => (
+                    tx.fee_account.as_deref(),
+                    tx.fee_account_muxed.as_deref(),
+                ),
+                txwatch_config::SourceAccountField::FeeAccount => (
+                    tx.source_account.as_deref(),
+                    tx.source_account_muxed.as_deref(),
+                ),
+            };
+            let same = |entry: &String, src: &str| {
+                if entry.starts_with('M') {
+                    matched_muxed == Some(entry.as_str())
+                } else {
+                    entry == src
                 }
             };
             match matched_account {
@@ -1202,14 +1228,14 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
                         &Vec::new()
                     };
                     if !list.is_empty() {
-                        let is_member = list.iter().any(|a| a == src);
+                        let is_member = list.iter().any(|a| same(a, src));
                         match mode {
                             txwatch_config::SourceAccountMode::In => is_member,
                             txwatch_config::SourceAccountMode::NotIn => !is_member,
                         }
                     } else {
-                        let in_allow = allow.iter().any(|a| a == src);
-                        let in_deny = deny.iter().any(|d| d == src);
+                        let in_allow = allow.iter().any(|a| same(a, src));
+                        let in_deny = deny.iter().any(|d| same(d, src));
                         if !allow.is_empty() {
                             // `allow` gates the rule; an address on the `deny`
                             // fire-list still fires, so it can carve out exceptions.
@@ -1892,31 +1918,11 @@ impl RateTracker {
             }
 
             let label = rule.label();
-            let window = i64::try_from(*window_seconds)
-                .ok()
-                .and_then(chrono::TimeDelta::try_seconds)
-                .unwrap_or(chrono::TimeDelta::MAX);
-            let hits = self
-                .hits
-                .entry((ctx.contract_id.to_owned(), label.clone()))
-                .or_default();
-            hits.push_back(now);
-            while hits
-                .front()
-                .is_some_and(|t| now.signed_duration_since(*t) >= window)
-            {
-                hits.pop_front();
-            }
-            // #401: never keep more than `count` timestamps per rule.
-            let cap = usize::try_from(*count).unwrap_or(usize::MAX).max(1);
-            while hits.len() > cap {
-                hits.pop_front();
-            }
-            let observed = hits.len() as u64;
-            if observed < *count {
+            let Some(observed) =
+                self.record(ctx.contract_id, &label, *count, *window_seconds, now)
+            else {
                 continue;
-            }
-            hits.clear();
+            };
 
             // Build the payload from the nested rule so every transaction
             // field is filled the same way, then relabel it as the rate rule.
@@ -1940,6 +1946,58 @@ impl RateTracker {
             }
         }
         out
+    }
+
+    /// Record one match of `rule` on `contract_id` at `now` and report whether
+    /// it completes a breach: `count` matches within `window_seconds`. A breach
+    /// clears the window, so a burst of `n` matches fires `n / count` times.
+    pub fn check(
+        &mut self,
+        contract_id: &str,
+        rule: &str,
+        count: u32,
+        window_seconds: u64,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.record(contract_id, rule, u64::from(count), window_seconds, now)
+            .is_some()
+    }
+
+    /// [`check`](Self::check), returning the observed match count on a breach.
+    fn record(
+        &mut self,
+        contract_id: &str,
+        rule: &str,
+        count: u64,
+        window_seconds: u64,
+        now: DateTime<Utc>,
+    ) -> Option<u64> {
+        let window = i64::try_from(window_seconds)
+            .ok()
+            .and_then(chrono::TimeDelta::try_seconds)
+            .unwrap_or(chrono::TimeDelta::MAX);
+        let hits = self
+            .hits
+            .entry((contract_id.to_owned(), rule.to_owned()))
+            .or_default();
+        hits.push_back(now);
+        while hits
+            .front()
+            .is_some_and(|t| now.signed_duration_since(*t) >= window)
+        {
+            hits.pop_front();
+        }
+        // #401: never keep more than `count` timestamps per rule.
+        let cap = usize::try_from(count).unwrap_or(usize::MAX).max(1);
+        while hits.len() > cap {
+            hits.pop_front();
+        }
+        let observed = hits.len() as u64;
+        if observed < count {
+            return None;
+        }
+        hits.clear();
+        Some(observed)
     }
 
     /// Drop every entry whose `(contract, rule)` key is not present in
@@ -2017,7 +2075,7 @@ mod tests {
     ) -> EnrichedTransaction {
         let function_names: Vec<String> = function_names.iter().map(|s| s.to_string()).collect();
 
-        EnrichedTransaction {
+        EnrichedTransaction { fee_account_muxed: None, source_account_muxed: None, source_account_muxed_id: None,
             hash: "abc123".into(),
             timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
             successful,
@@ -2118,7 +2176,7 @@ mod tests {
             "AdminFunctionCalled([set_admin, upgrade])"
         );
         assert_eq!(
-            AlertRule::HighFee {
+            AlertRule::HighFee { computed_threshold_stroops: 0,
                 threshold_stroops: 10_000,
                 threshold_xlm: None
             }
@@ -2161,7 +2219,7 @@ mod tests {
             "AdminFunctionCalled"
         );
         assert_eq!(
-            AlertRule::HighFee {
+            AlertRule::HighFee { computed_threshold_stroops: 0,
                 threshold_stroops: 1,
                 threshold_xlm: None
             }
@@ -2189,13 +2247,13 @@ mod tests {
             AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into(), "upgrade".into()],
             },
-            AlertRule::HighFee {
+            AlertRule::HighFee { computed_threshold_stroops: 0,
                 threshold_stroops: 50_000,
                 threshold_xlm: None,
             },
         ];
         // A transaction that will satisfy every rule.
-        let mut tx = EnrichedTransaction {
+        let mut tx = EnrichedTransaction { fee_account_muxed: None, source_account_muxed: None, source_account_muxed_id: None,
             hash: "abc123".into(),
             timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
             successful: false,
@@ -2453,7 +2511,7 @@ mod tests {
     fn url_fields_have_no_trailing_slash_and_exact_format() {
         // Verify both link fields are normalised even when base URLs have trailing slashes.
         fn run_with_bases(horizon_base: &str, explorer_base: Option<&str>) -> AlertPayload {
-            let tx = EnrichedTransaction {
+            let tx = EnrichedTransaction { fee_account_muxed: None, source_account_muxed: None, source_account_muxed_id: None,
                 hash: "deadbeef".into(),
                 timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
                 successful: true,
@@ -2516,7 +2574,7 @@ mod tests {
         let mut tx = make_tx(true, &[], None);
         tx.fee_charged_stroops = Some(10_000);
         let payloads = run(
-            &[entry(AlertRule::HighFee {
+            &[entry(AlertRule::HighFee { computed_threshold_stroops: 0,
                 threshold_stroops: 10_000,
                 threshold_xlm: None,
             })],
@@ -2531,7 +2589,7 @@ mod tests {
         let mut tx = make_tx(true, &[], None);
         tx.fee_charged_stroops = Some(9_999);
         let payloads = run(
-            &[entry(AlertRule::HighFee {
+            &[entry(AlertRule::HighFee { computed_threshold_stroops: 0,
                 threshold_stroops: 10_000,
                 threshold_xlm: None,
             })],
@@ -2544,7 +2602,7 @@ mod tests {
     fn high_fee_no_fee_does_not_fire() {
         let tx = make_tx(true, &[], None);
         let payloads = run(
-            &[entry(AlertRule::HighFee {
+            &[entry(AlertRule::HighFee { computed_threshold_stroops: 0,
                 threshold_stroops: 1,
                 threshold_xlm: None,
             })],
@@ -2700,7 +2758,7 @@ mod tests {
 
     #[test]
     fn alert_payload_serialises_to_valid_json_with_all_fields_present() {
-        let payload = AlertPayload {
+        let payload = AlertPayload { amount_in_stroops: None, amount_out_stroops: None,
             schema_version: 1,
             alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "My Contract".into(),
@@ -3747,7 +3805,7 @@ mod prop_tests {
         function_names: Vec<String>,
         successful: bool,
     ) -> EnrichedTransaction {
-        EnrichedTransaction {
+        EnrichedTransaction { invocations: Vec::new(),
             hash: "proptesthash".into(),
             timestamp: "2024-01-01T00:00:00Z".parse().unwrap(),
             successful,
@@ -3832,7 +3890,7 @@ mod prop_tests {
             threshold in 1u64..=u64::MAX,
         ) {
             let tx = arb_tx(None, Some(fee), vec![], true);
-            let rule = AlertRule::HighFee { threshold_stroops: threshold, threshold_xlm: None };
+            let rule = AlertRule::HighFee { computed_threshold_stroops: 0, threshold_stroops: threshold, threshold_xlm: None };
             let payloads = eval_one(rule, &tx);
             let should_fire = fee >= threshold;
             prop_assert_eq!(payloads.len() == 1, should_fire,
@@ -3851,7 +3909,7 @@ mod prop_tests {
                 AlertRule::AnyTransaction,
                 AlertRule::TransactionFailed,
                 AlertRule::LargeTransfer { threshold_xlm: 1, threshold_stroops: 0, direction: "any".into() },
-                AlertRule::HighFee { threshold_stroops: 1, threshold_xlm: None },
+                AlertRule::HighFee { computed_threshold_stroops: 0, threshold_stroops: 1, threshold_xlm: None },
             ];
             let ctx = EvalContext {
                 label: "PropTest",
@@ -4173,6 +4231,10 @@ mod suppressor_tests {
     #[test]
     fn identical_rules_on_one_contract_do_not_collide() {
         let tx = EnrichedTransaction {
+            invocations: Vec::new(),
+            source_account_muxed: None,
+            source_account_muxed_id: None,
+            fee_account_muxed: None,
             hash: "deadbeef".into(),
             timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
             successful: true,
@@ -4230,7 +4292,7 @@ mod suppressor_tests {
 
     #[test]
     fn evaluate_sets_alert_id_per_rule() {
-        let tx = EnrichedTransaction {
+        let tx = EnrichedTransaction { fee_account_muxed: None, source_account_muxed: None, source_account_muxed_id: None,
             hash: "deadbeef".into(),
             timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
             successful: false,
@@ -4283,7 +4345,7 @@ mod suppressor_tests {
     // ── Issue #48: MAX_XLM_SUPPLY_STROOPS sanity check ────────────────────────
 
     fn raw_tx(fee_charged: Option<&str>) -> HorizonTransaction {
-        HorizonTransaction {
+        HorizonTransaction { fee_account_muxed: None, source_account_muxed: None, source_account_muxed_id: None,
             hash: "h1".into(),
             created_at: "2024-06-01T00:00:00Z".into(),
             successful: true,
@@ -4340,7 +4402,7 @@ mod suppressor_tests {
         amount: Option<u64>,
     ) -> EnrichedTransaction {
         let function_names: Vec<String> = function_names.iter().map(|s| s.to_string()).collect();
-        EnrichedTransaction {
+        EnrichedTransaction { fee_account_muxed: None, source_account_muxed: None, source_account_muxed_id: None,
             hash: "abc123".into(),
             timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
             successful,
@@ -4820,6 +4882,10 @@ mod suppressor_tests {
 
     fn with_cooldown(rule: AlertRule, cooldown: u64) -> RuleConfig {
         RuleConfig {
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
             rule,
             cooldown_seconds: Some(cooldown),
             cooldown_summary: false,
@@ -4938,6 +5004,10 @@ mod suppressor_tests {
             rule: AlertRule::AnyTransaction,
             cooldown_seconds: Some(60),
             cooldown_summary: true,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         };
         let rules = vec![rule_cfg];
         let mut tracker = CooldownTracker::new();
@@ -4988,6 +5058,10 @@ mod suppressor_tests {
             rule: AlertRule::AnyTransaction,
             cooldown_seconds: Some(60),
             cooldown_summary: false,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         };
         let rules = vec![rule_cfg];
         let mut tracker = CooldownTracker::new();
