@@ -133,19 +133,24 @@ pub fn write_state_blocking(path: &Path, doc: &StateDocument) -> Result<()> {
     use std::io::Write;
 
     let raw = serde_json::to_string_pretty(doc).context("failed to serialize state document")?;
-    let tmp = path.with_extension("tmp");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut file = fs::File::create(&tmp)
-        .with_context(|| format!("failed to write state file '{}'", tmp.display()))?;
-    file.write_all(raw.as_bytes())
-        .with_context(|| format!("failed to write state file '{}'", tmp.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to fsync state file '{}'", tmp.display()))?;
-    drop(file);
-    fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename state file '{}'", path.display()))?;
+    
+    // Issue #444: use a unique temp file name to prevent collisions between
+    // concurrent writers (async state writer, save_cursors, reload migration, etc.)
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
+    
+    let mut temp_file = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temp file in '{}'", parent.display()))?;
+    
+    temp_file.write_all(raw.as_bytes())
+        .with_context(|| format!("failed to write temp state file"))?;
+    temp_file.sync_all()
+        .with_context(|| format!("failed to fsync temp state file"))?;
+    
+    temp_file.persist(path)
+        .with_context(|| format!("failed to rename state file to '{}'", path.display()))?;
+    
     sync_parent_dir(path)?;
     Ok(())
 }
@@ -199,20 +204,32 @@ pub struct StateUpdate {
     pub no_activity: HashMap<String, NoActivityState>,
 }
 
+enum StateCommand {
+    Update(StateUpdate),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
 #[derive(Clone)]
 pub struct StateHandle {
-    sender: Option<tokio::sync::mpsc::UnboundedSender<StateUpdate>>,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<StateCommand>>,
 }
 
 impl StateHandle {
     pub fn send(&self, update: StateUpdate) {
         if let Some(s) = &self.sender {
-            let _ = s.send(update);
+            let _ = s.send(StateCommand::Update(update));
         }
     }
 
+    /// Issue #446: flush now waits for the writer to actually persist the latest state.
+    /// Returns once the file on disk contains all updates sent before this call.
     pub async fn flush(&self) {
-        tokio::task::yield_now().await;
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = sender.send(StateCommand::Flush(tx));
+        let _ = rx.await;
     }
 }
 
@@ -242,14 +259,64 @@ pub fn spawn_state_writer(cursor_file: Option<&str>) -> StateWriter {
         };
     };
     let path = PathBuf::from(path_str);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StateUpdate>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StateCommand>();
     let join = tokio::spawn(async move {
         let mut current_doc = StateDocument::default();
-        while let Some(update) = rx.recv().await {
-            current_doc.cursors.insert(update.cursor_key.clone(), update.cursor);
-            current_doc.cooldowns.insert(update.cursor_key.clone(), update.cooldowns);
-            current_doc.no_activity.insert(update.cursor_key, update.no_activity);
-            let _ = write_state_blocking(&path, &current_doc);
+        let mut pending_flushes: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+        
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                StateCommand::Update(update) => {
+                    // Apply this update to the in-memory document
+                    current_doc.cursors.insert(update.cursor_key.clone(), update.cursor);
+                    current_doc.cooldowns.insert(update.cursor_key.clone(), update.cooldowns);
+                    current_doc.no_activity.insert(update.cursor_key, update.no_activity);
+                }
+                StateCommand::Flush(ack) => {
+                    pending_flushes.push(ack);
+                }
+            }
+            
+            // Issue #446: batch queued updates by draining the channel with try_recv
+            loop {
+                match rx.try_recv() {
+                    Ok(StateCommand::Update(update)) => {
+                        current_doc.cursors.insert(update.cursor_key.clone(), update.cursor);
+                        current_doc.cooldowns.insert(update.cursor_key.clone(), update.cooldowns);
+                        current_doc.no_activity.insert(update.cursor_key, update.no_activity);
+                    }
+                    Ok(StateCommand::Flush(ack)) => {
+                        pending_flushes.push(ack);
+                    }
+                    Err(_) => break, // channel is empty, write the batched updates now
+                }
+            }
+            
+            // Issue #446: run the write in spawn_blocking to avoid blocking Tokio workers
+            let doc_clone = current_doc.clone();
+            let path_clone = path.clone();
+            let write_result = tokio::task::spawn_blocking(move || {
+                write_state_blocking(&path_clone, &doc_clone)
+            }).await;
+            
+            // Issue #445: log write errors instead of silently discarding them
+            match write_result {
+                Ok(Ok(())) => {
+                    // Write succeeded, acknowledge all pending flushes
+                    for ack in pending_flushes.drain(..) {
+                        let _ = ack.send(());
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("failed to persist state to '{}': {:?}", path.display(), e);
+                    // Drop the flush acknowledgements; flush callers will see a closed channel
+                    pending_flushes.clear();
+                }
+                Err(e) => {
+                    tracing::error!("state writer task panicked: {:?}", e);
+                    pending_flushes.clear();
+                }
+            }
         }
     });
     StateWriter {

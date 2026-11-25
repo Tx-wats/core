@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- State writer temp files now use unique names (`tempfile::NamedTempFile`) to prevent collisions between concurrent writers (async state writer, `save_cursors` on shutdown, reload migrations, `txwatch cursors` and `prune-cursors` commands) (#444).
+- State writer errors are now logged with `tracing::error!` instead of being silently discarded (#445).
+- `StateHandle::flush()` now waits for the writer to actually persist the latest state using a oneshot acknowledgement channel. The writer also batches queued updates with `try_recv` and runs writes in `spawn_blocking` to avoid blocking Tokio workers (#446).
+- `txwatch cursors` and `prune-cursors` commands now load and save through `persistence::load_state`/`save_state`, correctly handling the new `StateDocument` format (with `cursors`, `cooldowns`, and `no_activity` fields) introduced in #281. Legacy flat cursor maps are still supported for backward compatibility. When editing cursors, cooldowns and NoActivity states are preserved (#447).
+
 ### Added
 
 - `FunctionCalled` argument matching: `args = [{ index = 1, eq = "G…" }]` matches decoded invocation parameters (Address, Symbol, integer and String `ScVal`s); decoded invocations are included in the alert payload as `function_args` (#266).

@@ -1642,17 +1642,27 @@ fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
 /// Remove cursor entries whose cursor key matches no configured contract.
 /// Returns the removed keys. When `dry_run` is set the file is left untouched.
 fn prune_cursors(path: &str, cfg: &AppConfig, dry_run: bool) -> Result<Vec<String>> {
+    use txwatch_poller::StateDocument;
+    
     let path = Path::new(path);
     if !path.exists() {
         return Ok(Vec::new());
     }
+    
+    // Issue #447: load through persistence::load_state to handle new format
     let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read cursor file '{}'", path.display()))?;
-    let mut cursors: std::collections::BTreeMap<String, String> = if raw.trim().is_empty() {
-        std::collections::BTreeMap::new()
+        .with_context(|| format!("failed to read state file '{}'", path.display()))?;
+    let mut doc: StateDocument = if raw.trim().is_empty() {
+        StateDocument::default()
     } else {
-        serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse cursor file '{}'", path.display()))?
+        // Try new format first, then legacy flat cursor map
+        if let Ok(d) = serde_json::from_str::<StateDocument>(&raw) {
+            d
+        } else if let Ok(cursors) = serde_json::from_str::<std::collections::HashMap<String, String>>(&raw) {
+            StateDocument::from_cursors(cursors)
+        } else {
+            bail!("failed to parse state file '{}'", path.display());
+        }
     };
 
     let configured: std::collections::HashSet<String> = cfg
@@ -1661,23 +1671,21 @@ fn prune_cursors(path: &str, cfg: &AppConfig, dry_run: bool) -> Result<Vec<Strin
         .map(|c| c.cursor_key())
         .collect();
 
-    let stale: Vec<String> = cursors
+    let stale: Vec<String> = doc.cursors
         .keys()
         .filter(|key| !configured.contains(*key))
         .cloned()
         .collect();
 
+    // Issue #447: preserve cooldowns and no_activity when pruning cursors
     if !dry_run && !stale.is_empty() {
         for key in &stale {
-            cursors.remove(key);
+            doc.cursors.remove(key);
+            doc.cooldowns.remove(key);
+            doc.no_activity.remove(key);
         }
-        let serialized = serde_json::to_string_pretty(&cursors)?;
-        // Write to a sibling temp file and rename so a crash can't truncate it.
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, serialized)
-            .with_context(|| format!("failed to write '{}'", tmp.display()))?;
-        fs::rename(&tmp, path)
-            .with_context(|| format!("failed to replace '{}'", path.display()))?;
+        // Issue #447: write through the same atomic path as the poller
+        txwatch_poller::write_state_blocking(path, &doc)?;
     }
 
     Ok(stale)
