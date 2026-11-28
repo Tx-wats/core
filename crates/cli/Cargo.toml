@@ -37,7 +37,7 @@ base64 = "0.22"
 schemars = { workspace = true }
 clap_complete = "4"
 clap_mangen = "0.3"
-notify = "6"
+notify = "9"
 
 [dev-dependencies]
 wiremock = { workspace = true }
